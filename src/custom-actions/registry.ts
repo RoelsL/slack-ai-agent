@@ -7,6 +7,8 @@ import { withMessageId } from "../logger";
 import { config } from "../config";
 import { PersistentMap } from "../persistent-map";
 import type { SlackBlock } from "../types";
+import { z } from "zod";
+import type { FunctionToolDefinition } from "../agent-types";
 import type {
   CustomAction,
   ActionSlackContext,
@@ -19,8 +21,7 @@ import type {
  *
  * Responsibilities:
  * - Registers action definitions at startup
- * - Creates per-request SDK MCP servers (via `createSdkMcpServer`)
- *   that close over Slack context so Claude can call them naturally
+ * - Creates per-request OpenAI function tools that close over Slack context
  * - Posts Slack confirmation dialogs on tool invocation
  * - Dispatches approve/cancel button clicks to the correct action
  * - Purges stale sessions
@@ -54,7 +55,7 @@ export class CustomActionRegistry {
   }
 
   // ------------------------------------------------------------------
-  // MCP Server creation (per-request)
+  // Function-tool creation (per-request)
   // ------------------------------------------------------------------
 
   /**
@@ -64,49 +65,44 @@ export class CustomActionRegistry {
    * A *new* server is created every request so the tool handlers
    * can close over the specific `slackContext` for that request.
    */
-  async createMcpServerConfig(
+  createFunctionTools(
     slackContext: ActionSlackContext,
     filter?: (action: CustomAction<any>) => boolean,
-  ): Promise<Record<string, any>> {
-    // Deferred Session 2 adapter: custom actions are not exposed by Session 1.
-    const { createSdkMcpServer, tool } = await eval(
-      'import("@anthropic-ai/claude-agent-sdk")',
-    );
-
+  ): Array<{ definition: FunctionToolDefinition; execute: (args: unknown) => Promise<{ text: string; isError?: boolean }> }> {
     const actions = [...this.actions.values()].filter(
-      action => !filter || filter(action),
+      action => (!filter || filter(action)) && action.enabled?.() !== false,
     );
-    if (actions.length === 0) {
-      return {};
-    }
-
-    const byServer = new Map<string, CustomAction<any>[]>();
-    for (const action of actions) {
+    return actions.map(action => {
       const serverName = action.mcpServerName ?? "custom-actions";
-      const bucket = byServer.get(serverName) ?? [];
-      bucket.push(action);
-      byServer.set(serverName, bucket);
-    }
-
-    const servers: Record<string, any> = {};
-    for (const [serverName, serverActions] of byServer) {
-      const tools = serverActions.map(action =>
-        tool(
-          action.name,
-          action.description,
-          action.inputSchema,
-          async (args: any) => {
-            return this.handleToolCall(action.name, args, slackContext);
+      const name = `mcp__${serverName}__${action.name}`;
+      return {
+        definition: {
+          type: "function" as const,
+          function: {
+            name,
+            description: action.description,
+            parameters: zodShapeToJsonSchema(action.inputSchema),
           },
-        ),
-      );
-      servers[serverName] = createSdkMcpServer({
-        name: serverName,
-        tools,
-      });
-    }
+        },
+        execute: async (args: unknown) => {
+          const parsed = z.object(action.inputSchema).safeParse(args);
+          if (!parsed.success) return { text: "Invalid action arguments", isError: true };
+          const result = await this.handleToolCall(action.name, parsed.data, slackContext);
+          const text = result.content.map(part => part.text).join("\n");
+          return { text, isError: text.startsWith("Unknown action") || text.startsWith("Error in") };
+        },
+      };
+    });
+  }
 
-    return servers;
+  /** Compatibility-free direct dispatch entry point for the agent loop. */
+  async dispatch(actionName: string, args: unknown, ctx: ActionSlackContext): Promise<{ text: string; isError?: boolean }> {
+    const action = this.actions.get(actionName);
+    if (!action) return { text: `Unknown action: ${actionName}`, isError: true };
+    const parsed = z.object(action.inputSchema).safeParse(args);
+    if (!parsed.success) return { text: "Invalid action arguments", isError: true };
+    const result = await this.handleToolCall(actionName, parsed.data, ctx);
+    return { text: result.content.map(part => part.text).join("\n") };
   }
 
   // ------------------------------------------------------------------
@@ -638,4 +634,19 @@ export class CustomActionRegistry {
       sessionKey: value.substring(colonIdx + 1),
     };
   }
+}
+
+function zodShapeToJsonSchema(shape: Record<string, any>): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  for (const [name, schema] of Object.entries(shape)) {
+    const def = schema?._def;
+    const typeName = def?.typeName ?? def?.type;
+    const jsonType = typeName === "ZodNumber" || typeName === "number" ? "number"
+      : typeName === "ZodBoolean" || typeName === "boolean" ? "boolean"
+      : typeName === "ZodArray" || typeName === "array" ? "array" : "string";
+    properties[name] = { type: jsonType };
+    if (typeName !== "ZodOptional" && typeName !== "optional") required.push(name);
+  }
+  return { type: "object", properties, required };
 }

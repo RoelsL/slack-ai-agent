@@ -50,7 +50,7 @@ export interface ActionDependencies {
 export interface CustomAction<TParams> {
   /** MCP tool name suffix (full name becomes mcp__<mcpServerName>__<name>) */
   name: string;
-  /** Claude reads this to decide when to call the tool */
+  /** Description supplied to the provider when deciding whether to call. */
   description: string;
   /** MCP server namespace. Defaults to "custom-actions". */
   mcpServerName?: string;

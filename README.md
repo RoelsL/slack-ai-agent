@@ -1,14 +1,15 @@
 # Slack AI Agent
 
-A Slack app powered by a provider-neutral LiteLLM proxy. Responds in DMs, channels, and @-mentions with streaming responses, thread context, and file uploads. Session 1 has no MCP, custom-action, local-tool, skill, subagent, or sandbox execution.
+A Slack app powered by a provider-neutral LiteLLM proxy. Responds in DMs, channels, and @-mentions with streaming responses, thread context, file uploads, authorized MCP tools, and deployment-local custom actions. Local filesystem, Bash, web, skills, subagents, and sandboxing remain deferred to Session 3.
 
 ## Architecture
 
 - **`src/slack-handler.ts`** - Message routing and event handling
-- **`src/agent-handler.ts`** - Session management and LiteLLM text streaming
+- **`src/agent-handler.ts`** - Session management and bounded sequential LiteLLM tool loop
 - **`src/litellm-client.ts`** - Typed OpenAI-compatible HTTP/SSE client
 - **`src/agent-types.ts`** - Provider-neutral stream and transcript types
-- **`src/mcp-manager.ts`** - Deferred MCP configuration support; inactive in Session 1
+- **`src/mcp-manager.ts`** - MCP configuration, identity binding, headers helper, and centralized policy gate
+- **`src/mcp-client.ts`** - Per-request MCP discovery, schema adaptation, validation, timeout, and cleanup
 - **`src/message-processor.ts`** - Stream processing and response formatting
 - **`src/tracking.ts`** - Analytics tracking for message processing and feedback
 - **`src/channel-config.ts`** - Channel-specific context and configuration management
@@ -50,6 +51,25 @@ Slack user/channel/thread session. Requests include one current system prompt,
 up to the latest nine complete prior user/assistant pairs, and the current user
 turn. Successful transcripts retain the system prompt and latest 10 complete
 pairs. History is not persisted across restarts.
+
+Tool defaults are conservative: at most 8 agentic provider turns per request,
+30 seconds per MCP tool call, and 16,000 characters per tool result inserted in
+the transcript. MCP clients are created and closed for every request. `stdio`
+uses the SDK process transport, `sse` uses legacy SSE, and `http` means MCP
+Streamable HTTP; protocols are never silently substituted. The installed SDK is
+`@modelcontextprotocol/sdk` 1.29.0.
+
+Tool policy is deny-by-default. Only exact names matching
+`mcp__<server-name>__<tool-name>` can be advertised or dispatched. Role keys
+inherit in YAML order, and denylist entries override allowlist entries. Bot,
+workflow, and Slackbot requests have no human role or email and cannot access
+identity-bound servers.
+
+For remote servers, `headersHelper` is a trusted deployment-controlled `/bin/sh`
+command run per connection. It has a 5-second timeout, 32 KiB stdout cap, and
+16 KiB stderr cap. It must emit a JSON object whose values are strings. Helper
+headers override static/bound headers; helper failure aborts the connection and
+never falls back to unauthenticated access. Generated headers are never logged.
 
 ### 4. Configure the Bot
 

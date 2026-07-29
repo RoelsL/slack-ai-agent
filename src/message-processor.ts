@@ -71,6 +71,9 @@ export class MessageProcessor {
     let shouldNotRespond = false;
     let turnCount = 0;
     let streamedText = "";
+    const toolCalls: string[] = [];
+    const toolCallNames: string[] = [];
+    let confirmationDialogPosted = false;
     const phaseTimings: PhaseTimings = {};
     const started = Date.now();
     let first = false;
@@ -111,6 +114,13 @@ export class MessageProcessor {
           costUsd = event.totalCostUsd;
         }
         if (await honorsDoNotRespond(event.result)) shouldNotRespond = true;
+      } else if (event.type === "tool_result") {
+        toolCalls.push(event.result);
+        toolCallNames.push(event.toolName);
+        if (/confirmation dialog|Do not send any additional text/i.test(event.result)) {
+          confirmationDialogPosted = true;
+          shouldNotRespond = true;
+        }
       }
     }
     phaseTimings.provider_total_stream_ms = Date.now() - started;
@@ -124,6 +134,9 @@ export class MessageProcessor {
       tokenUsage,
       costUsd,
       turnCount: turnCount || undefined,
+      toolCalls: toolCalls.length ? toolCalls : undefined,
+      toolCallNames: toolCallNames.length ? toolCallNames : undefined,
+      confirmationDialogPosted: confirmationDialogPosted || undefined,
       phaseTimings,
     };
   }
@@ -136,7 +149,7 @@ export class MessageProcessor {
     }
     // The assistant event is authoritative for text. The result is metadata,
     // so never append its result and duplicate a streamed answer.
-    if (event.subtype === "error") debugLogs.push("Provider returned an error result");
+    if (event.type === "result" && event.subtype === "error") debugLogs.push("Provider returned an error result");
   }
 
   private async shouldShowReactions(context: SlackContext): Promise<boolean> {

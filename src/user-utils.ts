@@ -287,6 +287,11 @@ export class UserUtils {
     }
   }
 
+  static async getUserEmail(userId: string): Promise<string | undefined> {
+    const employee = await this.getEmployeeBySlackId(userId);
+    return employee?.email;
+  }
+
   /**
    * Start automatic cache cleanup interval (call once during app initialization)
    */

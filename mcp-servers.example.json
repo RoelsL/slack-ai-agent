@@ -1,13 +1,5 @@
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/Users/username/Code/"
-      ]
-    },
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -22,20 +14,20 @@
         "POSTGRES_CONNECTION_STRING": "postgresql://user:password@localhost:5432/dbname"
       }
     },
-    "web-search": {
+    "legacy-sse-example": {
       "type": "sse",
       "url": "http://localhost:3001/sse",
       "headers": {
         "Authorization": "Bearer your-api-key"
       }
     },
-    "internal-api": {
+    "streamable-http-example": {
       "type": "http",
       "url": "https://mcp.internal.example.com/mcp",
       "headers": {
         "X-Api-Version": "2024-01-01"
       },
-      "headersHelper": "cat \"$HOME/.config/my-app/mcp-auth-headers.json\""
+      "headersHelper": "/opt/company/bin/mcp-headers"
     }
   }
 }

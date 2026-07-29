@@ -3,6 +3,13 @@ import * as path from "path";
 import { Logger } from "./logger";
 import { CONTEXT_CACHE_TTL_MS } from "./constants";
 import * as yaml from "js-yaml";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
+export const MCP_HEADERS_HELPER_TIMEOUT_MS = 5_000;
+export const MCP_HEADERS_HELPER_MAX_STDOUT = 32 * 1024;
+export const MCP_HEADERS_HELPER_MAX_STDERR = 16 * 1024;
 
 /**
  * Tool allowlist loaded from config/tool-allowlist.yaml.
@@ -14,6 +21,16 @@ type ToolAllowlist = Record<string, string[]>;
 
 interface ToolDenylist {
   disallowed_tools: string[];
+}
+
+export interface ToolPolicyDecision {
+  allowed: boolean;
+  reason: "allowed" | "not-allowlisted" | "denylisted" | "invalid-policy" | "anonymous";
+}
+
+export interface ToolPolicyContext {
+  role?: string;
+  hasHumanIdentity: boolean;
 }
 
 export type McpStdioServerConfig = {
@@ -113,6 +130,32 @@ export function bindUserToMcpServers(
   }
 
   return { servers: bound, omitted };
+}
+
+/** Execute a deployment-owned helper and return only a validated string map. */
+export async function resolveMcpHeaders(
+  helper: string | undefined,
+  staticHeaders: Record<string, string> | undefined,
+): Promise<Record<string, string>> {
+  const headers = { ...(staticHeaders ?? {}) };
+  if (!helper?.trim()) return headers;
+  try {
+    const result = await execFileAsync("/bin/sh", ["-c", helper], {
+      timeout: MCP_HEADERS_HELPER_TIMEOUT_MS,
+      maxBuffer: Math.max(MCP_HEADERS_HELPER_MAX_STDOUT, MCP_HEADERS_HELPER_MAX_STDERR),
+      windowsHide: true,
+    });
+    const parsed: unknown = JSON.parse(String(result.stdout));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("helper output is not an object");
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!key || typeof value !== "string") throw new Error("helper headers must be strings");
+      headers[key] = value;
+    }
+    return headers;
+  } catch {
+    // Never connect without credentials when a configured helper fails.
+    throw new Error("MCP header helper failed");
+  }
 }
 
 export class McpManager {
@@ -233,6 +276,13 @@ export class McpManager {
     return config?.mcpServers;
   }
 
+  bindForRequest(
+    servers: Record<string, McpServerConfig>,
+    userEmail: string | undefined,
+  ): Record<string, McpServerConfig> {
+    return bindUserToMcpServers(servers, userEmail).servers;
+  }
+
   /**
    * Load tool allowlist from local config file with caching
    */
@@ -304,6 +354,35 @@ export class McpManager {
     return tools;
   }
 
+  /** The single authorization gate used for advertisement and dispatch. */
+  async authorizeTool(name: string, context: ToolPolicyContext): Promise<ToolPolicyDecision> {
+    if (!/^mcp__[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(name)) {
+      return { allowed: false, reason: "not-allowlisted" };
+    }
+    if (!context.hasHumanIdentity) return { allowed: false, reason: "anonymous" };
+    try {
+      const allowed = await this.getAllowedTools(context.role ?? "none");
+      const denylisted = this.getDisallowedTools();
+      if (this.denylistCache?.isError) {
+        return { allowed: false, reason: "invalid-policy" };
+      }
+      if (denylisted.some(pattern => this.matchesTool(pattern, name))) {
+        return { allowed: false, reason: "denylisted" };
+      }
+      if (!allowed.some(pattern => this.matchesTool(pattern, name))) {
+        return { allowed: false, reason: "not-allowlisted" };
+      }
+      return { allowed: true, reason: "allowed" };
+    } catch {
+      return { allowed: false, reason: "invalid-policy" };
+    }
+  }
+
+  private matchesTool(pattern: unknown, name: string): boolean {
+    // Legacy native names and Bash(...) entries intentionally never match.
+    return typeof pattern === "string" && /^mcp__[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(pattern) && pattern === name;
+  }
+
   // Retry loading denylist every 30s on error so fixes are picked up quickly
   private static readonly DENYLIST_ERROR_CACHE_TTL_MS = 30 * 1000;
 
@@ -326,9 +405,7 @@ export class McpManager {
 
     const denylistPath = path.resolve("config/tool-denylist.yaml");
     if (!fs.existsSync(denylistPath)) {
-      this.logger.warn(
-        "No tool denylist file found — no tools will be blocked",
-      );
+      this.logger.warn("No tool denylist file found — denying all tools");
       this.denylistCache = { data: [], fetchedAt: now, isError: true };
       return [];
     }
@@ -338,10 +415,7 @@ export class McpManager {
       const denylistContent = fs.readFileSync(denylistPath, "utf-8");
       denylist = yaml.load(denylistContent) as ToolDenylist;
     } catch (error) {
-      this.logger.warn(
-        "Failed to read/parse tool denylist file — no tools will be blocked",
-        error,
-      );
+      this.logger.warn("Failed to read/parse tool denylist file — denying all tools", error);
       this.denylistCache = { data: [], fetchedAt: now, isError: true };
       return [];
     }
@@ -351,9 +425,7 @@ export class McpManager {
       !Array.isArray(denylist.disallowed_tools) ||
       denylist.disallowed_tools.length === 0
     ) {
-      this.logger.warn(
-        "Tool denylist file exists but has no valid disallowed_tools entries — no tools will be blocked",
-      );
+      this.logger.warn("Tool denylist file exists but has no valid disallowed_tools entries");
       this.denylistCache = { data: [], fetchedAt: now, isError: true };
       return [];
     }

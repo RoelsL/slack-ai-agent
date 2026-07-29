@@ -10,6 +10,8 @@ import { Logger } from "./logger";
 import { UserUtils } from "./user-utils";
 import { initTracking } from "./tracking";
 import { ChannelConfigManager } from "./channel-config";
+import { McpManager } from "./mcp-manager";
+import { CustomActionRegistry, loadCustomActions } from "./custom-actions";
 
 const logger = new Logger("Main");
 
@@ -32,7 +34,12 @@ async function start() {
 
     const reactionManager = new ReactionManager(app);
 
-    const agentHandler = new AgentHandler();
+    const mcpManager = new McpManager();
+    const customActionRegistry = new CustomActionRegistry(app, reactionManager);
+    for (const action of await loadCustomActions()) customActionRegistry.register(action);
+    customActionRegistry.setupButtonHandlers();
+    customActionRegistry.startSessionCleanup();
+    const agentHandler = new AgentHandler(undefined, mcpManager, customActionRegistry);
     const slackHandler = new SlackHandler(
       app,
       agentHandler,
@@ -82,7 +89,7 @@ async function start() {
       debugMode: config.debug,
       baseDirectory: config.baseDirectory,
       inference: "LiteLLM text streaming",
-      tools: "disabled in Session 1",
+       tools: "authorized MCP and custom actions only",
     });
   } catch (error) {
     logger.error("Failed to start the bot", error);

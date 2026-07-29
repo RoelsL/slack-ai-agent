@@ -63,6 +63,30 @@ function getDeltaText(value: unknown): string | undefined {
   return typeof content === "string" ? content : undefined;
 }
 
+function getToolCallDeltas(value: unknown): ProviderStreamChunk["toolCallDeltas"] {
+  if (!value || typeof value !== "object") return undefined;
+  const choices = (value as Record<string, unknown>).choices;
+  if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== "object") return undefined;
+  const delta = (choices[0] as Record<string, unknown>).delta;
+  if (!delta || typeof delta !== "object") return undefined;
+  const calls = (delta as Record<string, unknown>).tool_calls;
+  if (!Array.isArray(calls)) return undefined;
+  const result = calls.flatMap((call): NonNullable<ProviderStreamChunk["toolCallDeltas"]> => {
+    if (!call || typeof call !== "object") return [];
+    const record = call as Record<string, unknown>;
+    if (typeof record.index !== "number") return [];
+    const fn = record.function;
+    const functionRecord = fn && typeof fn === "object" ? fn as Record<string, unknown> : undefined;
+    return [{
+      index: record.index,
+      ...(typeof record.id === "string" && { id: record.id }),
+      ...(typeof functionRecord?.name === "string" && { name: functionRecord.name }),
+      ...(typeof functionRecord?.arguments === "string" && { argumentsDelta: functionRecord.arguments }),
+    }];
+  });
+  return result.length ? result : undefined;
+}
+
 function costFromWire(value: unknown): number | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
@@ -231,13 +255,15 @@ function parseSseEvent(event: string): { done: boolean; value?: ProviderStreamCh
   }
   const record = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   const text = getDeltaText(json);
+  const toolCallDeltas = getToolCallDeltas(json);
   const usage = usageFromWire(record.usage);
   const totalCostUsd = costFromWire(json);
-  if (!text && !usage && totalCostUsd === undefined) return { done: false };
+  if (!text && !toolCallDeltas?.length && !usage && totalCostUsd === undefined) return { done: false };
   return {
     done: false,
     value: {
       ...(text !== undefined && { text }),
+      ...(toolCallDeltas && { toolCallDeltas }),
       ...(usage && { usage }),
       ...(totalCostUsd !== undefined && { totalCostUsd }),
     },
