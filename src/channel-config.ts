@@ -11,7 +11,7 @@ interface ChannelSettings {
   channelNamePattern: string;
   /** Instruction file (in config/instructions/) appended as channel context. */
   file?: string;
-  /** Per-channel Claude model override (one of the AllowedModel literals). */
+  /** Per-channel provider deployment override. */
   model?: AllowedModel;
   /** Per-channel effort override. Dropped for models that don't accept effort (e.g. Haiku). */
   effort?: EffortLevel;
@@ -107,11 +107,19 @@ export class ChannelConfigManager {
       path.resolve("config/channels.yaml"),
       "utf-8",
     );
-    const loadedConfig = yaml.load(configContent) as ChannelConfig;
+    const loadedConfig = yaml.load(configContent) as ChannelConfig | null;
+    // Empty YAML mappings containing only comments parse as null. Normalize
+    // optional mapping sections so routing checks cannot crash on valid config.
+    const config: ChannelConfig = {
+      ...(loadedConfig ?? {}),
+      channelSettings: loadedConfig?.channelSettings ?? [],
+      ephemeralChannelConfig: loadedConfig?.ephemeralChannelConfig ?? {},
+      dmNotificationConfig: loadedConfig?.dmNotificationConfig ?? {},
+    };
 
-    this.configCache.set(cacheKey, { data: loadedConfig, fetchedAt: now });
+    this.configCache.set(cacheKey, { data: config, fetchedAt: now });
     this.logger.debug("Loaded channel config from local file");
-    return loadedConfig;
+    return config;
   }
 
   private async loadGeneralContext(): Promise<string> {
@@ -359,7 +367,7 @@ export class ChannelConfigManager {
     return isMentioned;
   }
 
-  /** Per-channel Claude model / effort / fast-mode override, if configured. */
+  /** Per-channel model / effort / fast-mode override, if configured. */
   async getChannelModelOverride(
     channelId: string,
     channelType: SlackChannelType,

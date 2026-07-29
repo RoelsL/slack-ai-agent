@@ -32,6 +32,7 @@ jest.mock("js-yaml", () => ({
 
 import { ChannelConfigManager } from "./channel-config";
 import { SlackChannelType } from "./types";
+import * as yaml from "js-yaml";
 
 describe("ChannelConfigManager", () => {
   let manager: ChannelConfigManager;
@@ -117,6 +118,35 @@ describe("ChannelConfigManager", () => {
 
     it("returns false for undefined", () => {
       expect(manager.isDirectMessage(undefined)).toBe(false);
+    });
+  });
+
+  describe("empty routing configuration", () => {
+    beforeEach(() => {
+      (yaml.load as jest.Mock).mockReturnValue({
+        channelSettings: [],
+        conditionalReplyChannels: [],
+        ephemeralChannelConfig: null,
+        dmNotificationConfig: null,
+      });
+    });
+
+    it("treats null ephemeral configuration as empty", async () => {
+      await expect(
+        manager.shouldUseEphemeralMessaging("C0BKX686U4X"),
+      ).resolves.toBe(false);
+      await expect(
+        manager.getEphemeralTargetUsers("C0BKX686U4X"),
+      ).resolves.toEqual([]);
+      await expect(
+        manager.getEphemeralTargetChannels("C0BKX686U4X"),
+      ).resolves.toEqual([]);
+    });
+
+    it("treats null DM notification configuration as empty", async () => {
+      await expect(
+        manager.shouldSendDM("C0BKX686U4X", "U123"),
+      ).resolves.toBe(false);
     });
   });
 
