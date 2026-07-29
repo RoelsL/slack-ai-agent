@@ -28,7 +28,7 @@ export type McpSSEServerConfig = {
   url: string;
   headers?: Record<string, string>;
   /**
-   * Shell command the Claude CLI runs on each connection; its stdout (a JSON
+   * Deferred Session 2 header helper command; its stdout (a JSON
    * object) is merged over `headers`. Lets short-lived credentials (e.g. a
    * service-account token a cron job refreshes on disk) stay fresh without
    * regenerating mcp-servers.json.

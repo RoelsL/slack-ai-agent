@@ -2,8 +2,9 @@ export interface ConversationSession {
   userId: string;
   channelId: string;
   threadTs?: string;
-  sessionId?: string;
-  /** Per-thread sandbox cwd under /tmp/slack-ai-agent/workspaces/. */
+  /** Normalized in-memory transcript sent to the provider. */
+  history: import("./agent-types").AgentMessage[];
+  /** Legacy/deferred workspace path; Session 1 does not enforce a sandbox. */
   workingDirectory: string;
   lastActivity: Date;
 }
@@ -60,7 +61,7 @@ export interface SlackContext {
    *  reactions are enabled (non-ephemeral contexts), so custom actions can
    *  update the reaction through the session path while the turn is live. */
   reactionKey?: string;
-  /** Per-thread agent workspace; used for cwd and sandbox writes. */
+  /** Legacy/deferred workspace path; Session 1 does not enforce a sandbox. */
   workingDirectory?: string;
 }
 

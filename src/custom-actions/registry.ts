@@ -68,7 +68,7 @@ export class CustomActionRegistry {
     slackContext: ActionSlackContext,
     filter?: (action: CustomAction<any>) => boolean,
   ): Promise<Record<string, any>> {
-    // Dynamic ESM import (same pattern as claude-handler.ts)
+    // Deferred Session 2 adapter: custom actions are not exposed by Session 1.
     const { createSdkMcpServer, tool } = await eval(
       'import("@anthropic-ai/claude-agent-sdk")',
     );

@@ -1,19 +1,8 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeHandler } from "./claude-handler";
+import { AgentStreamEvent } from "./agent-types";
 import { RequestMode } from "./request-mode";
-import {
-  ConversationSession,
-  SlackContext,
-  TokenUsage,
-  PhaseTimings,
-} from "./types";
-import { Logger, truncateForLog } from "./logger";
-import { ReactionManager, REACTIONS } from "./reaction-manager";
-import { ChannelConfigManager } from "./channel-config";
-import {
-  TOOL_CALL_PARAM_LOG_MAX_LENGTH,
-  TOOL_RESPONSE_LOG_MAX_LENGTH,
-} from "./constants";
+import { ConversationSession, PhaseTimings, SlackContext, TokenUsage } from "./types";
+import { Logger } from "./logger";
+import { REACTIONS } from "./reaction-manager";
 
 export interface MessageProcessorResult {
   messages: string[];
@@ -21,82 +10,50 @@ export interface MessageProcessorResult {
   debugLogs?: string[];
   toolCalls?: string[];
   toolCallNames?: string[];
-  /** True when an custom action posted a confirmation dialog this turn. */
   confirmationDialogPosted?: boolean;
   tokenUsage?: TokenUsage;
   turnCount?: number;
-  /** Total Claude API cost (USD) for this message, from the SDK result message. */
   costUsd?: number;
   phaseTimings?: PhaseTimings;
 }
 
-/** Tool results that tell the agent not to send a follow-up chat message. */
-const CUSTOM_ACTION_SUPPRESSES_REPLY =
-  /confirmation dialog has been posted|Do not send any additional text response to the user/i;
+interface AgentStreamProvider {
+  streamQuery(
+    prompt: string,
+    session: ConversationSession,
+    abortController?: AbortController,
+    workingDirectory?: string,
+    slackContext?: SlackContext,
+    onRetry?: (attempt: number) => void,
+    systemPrompt?: string,
+    requestMode?: RequestMode,
+  ): AsyncGenerator<AgentStreamEvent, void, unknown>;
+}
+
+interface ReactionSink {
+  updateReaction(sessionKey: string, reaction: string): Promise<void>;
+}
+
+interface MessageChannelConfig {
+  shouldUseEphemeralMessaging(channel: string): Promise<boolean>;
+  getEphemeralTargetUsers(channel: string): Promise<string[]>;
+  isConditionalReplyChannel(
+    channel: string,
+    channelType: SlackContext["channelType"],
+  ): Promise<boolean>;
+}
 
 export class MessageProcessor {
   private logger = new Logger("MessageProcessor");
-  private claudeHandler: ClaudeHandler;
-  private reactionManager: ReactionManager;
-  private channelConfig: ChannelConfigManager;
 
   constructor(
-    claudeHandler: ClaudeHandler,
-    reactionManager: ReactionManager,
-    channelConfig: ChannelConfigManager,
-  ) {
-    this.claudeHandler = claudeHandler;
-    this.reactionManager = reactionManager;
-    this.channelConfig = channelConfig;
-  }
+    private readonly agentHandler: AgentStreamProvider,
+    private readonly reactionManager: ReactionSink,
+    private readonly channelConfig: MessageChannelConfig,
+  ) {}
 
-  /**
-   * Log with privacy handling and optionally add to debug logs for [DEBUG] mode.
-   * Server logs respect allowFullLogging; debug logs always show full content + safeData.
-   */
-  private logSensitive(
-    message: string,
-    safeData: Record<string, unknown>,
-    sensitiveContent: string,
-    allowFullLogging: boolean,
-    isDebugMode?: boolean,
-    debugLogs?: string[],
-  ): void {
-    this.logger.infoSensitive(
-      message,
-      safeData,
-      sensitiveContent,
-      allowFullLogging,
-    );
-    if (isDebugMode && debugLogs) {
-      const safeStr =
-        Object.keys(safeData).length > 0 ? ` ${JSON.stringify(safeData)}` : "";
-      debugLogs.push(`${message} ${sensitiveContent}${safeStr}`);
-    }
-  }
-
-  /**
-   * Check if reactions should be shown for this message (no reactions for ephemeral messages)
-   */
-  private async shouldShowReactions(
-    slackContext: SlackContext,
-  ): Promise<boolean> {
-    const isEphemeralChannel =
-      await this.channelConfig.shouldUseEphemeralMessaging(
-        slackContext.channel,
-      );
-    const willBeEphemeral =
-      isEphemeralChannel &&
-      !slackContext.explicitMention &&
-      (await this.channelConfig.getEphemeralTargetUsers(slackContext.channel))
-        .length > 0;
-    return !willBeEphemeral;
-  }
-
-  /**
-   * Process messages from Claude SDK stream
-   */
-  async processClaudeStream(
+  /** Process one provider-neutral text stream and retain the public result shape. */
+  async processAgentStream(
     prompt: string,
     session: ConversationSession,
     abortController: AbortController,
@@ -104,387 +61,87 @@ export class MessageProcessor {
     slackContext?: SlackContext,
     sessionKey?: string,
     systemPrompt?: string,
-    allowFullLogging?: boolean,
+    _allowFullLogging?: boolean,
     requestMode?: RequestMode,
   ): Promise<MessageProcessorResult> {
-    const currentMessages: string[] = [];
+    const messages: string[] = [];
     const debugLogs: string[] = [];
-    const toolCalls: string[] = [];
-    const toolCallNames: string[] = [];
-    let confirmationDialogPosted = false;
-    let shouldNotRespond = false;
     let tokenUsage: TokenUsage | undefined;
     let costUsd: number | undefined;
+    let shouldNotRespond = false;
     let turnCount = 0;
-    const timings: PhaseTimings = {};
+    let streamedText = "";
+    const phaseTimings: PhaseTimings = {};
+    const started = Date.now();
+    let first = false;
+    let isConditionalReplyChannel: boolean | undefined;
 
-    // Check if debug mode is enabled
-    const isDebugMode = prompt.includes("[DEBUG]");
+    const honorsDoNotRespond = async (text: string): Promise<boolean> => {
+      if (!/DO_NOT_RESPOND/i.test(text) || !slackContext) return false;
+      if (isConditionalReplyChannel === undefined) {
+        isConditionalReplyChannel =
+          await this.channelConfig.isConditionalReplyChannel(
+            slackContext.channel,
+            slackContext.channelType,
+          );
+      }
+      return isConditionalReplyChannel;
+    };
 
-    // Log query start with session info
-    this.logger.info("📝 Starting query", {
-      promptLen: prompt.length,
-      resuming: !!session.sessionId,
-      isDebugMode: isDebugMode ? "true" : "false",
-    });
-
-    // Start with thinking reaction
-    const reactionStart = Date.now();
-    if (
-      sessionKey &&
-      slackContext &&
-      (await this.shouldShowReactions(slackContext))
-    ) {
+    if (sessionKey && slackContext && await this.shouldShowReactions(slackContext)) {
       await this.reactionManager.updateReaction(sessionKey, REACTIONS.THINKING);
     }
-    timings.initial_reaction_ms = Date.now() - reactionStart;
-
-    const streamStart = Date.now();
-    let firstMessageReceived = false;
-
-    for await (const message of this.claudeHandler.streamQuery(
-      prompt,
-      session,
-      abortController,
-      workingDirectory,
-      slackContext,
-      async () => {},
-      systemPrompt,
-      requestMode,
+    for await (const event of this.agentHandler.streamQuery(
+      prompt, session, abortController, workingDirectory, slackContext,
+      undefined, systemPrompt, requestMode,
     )) {
-      if (!firstMessageReceived) {
-        timings.claude_time_to_first_message_ms = Date.now() - streamStart;
-        firstMessageReceived = true;
+      if (!first) {
+        phaseTimings.provider_time_to_first_message_ms = Date.now() - started;
+        first = true;
       }
-
-      if (abortController.signal.aborted) {
-        this.logger.warn("⏹️ Aborted", { sessionKey });
-        break;
-      }
-
-      if (message.type === "assistant") {
-        // Count each assistant message as a turn in the agentic loop
+      this.processEvent(event, messages, debugLogs);
+      if (event.type === "assistant") {
         turnCount++;
-
-        await this.processAssistantMessage(
-          message,
-          currentMessages,
-          sessionKey,
-          slackContext,
-          isDebugMode,
-          debugLogs,
-          toolCalls,
-          toolCallNames,
-          allowFullLogging,
-        );
-
-        // Check for special responses
-        const content = this.extractTextContent(message);
-        if (
-          content &&
-          slackContext &&
-          (await this.channelConfig.isConditionalReplyChannel(
-            slackContext.channel,
-            slackContext.channelType,
-          ))
-        ) {
-          if (content.match(/DO_NOT_RESPOND/i)) {
-            shouldNotRespond = true;
-          }
+        const text = event.message.content.map(part => part.text).join("");
+        streamedText += text;
+        if (await honorsDoNotRespond(text)) shouldNotRespond = true;
+      } else if (event.type === "result") {
+        if (event.usage) tokenUsage = event.usage;
+        if (event.totalCostUsd !== undefined) {
+          costUsd = event.totalCostUsd;
         }
-      } else if (message.type === "user") {
-        // Handle tool result messages (user messages with tool_result content)
-        const suppressReply = this.processToolResultMessage(
-          message,
-          isDebugMode,
-          debugLogs,
-          allowFullLogging,
-        );
-        if (suppressReply?.confirmationDialogPosted) {
-          confirmationDialogPosted = true;
-        }
-        if (suppressReply?.shouldNotRespond) {
-          shouldNotRespond = true;
-        }
-      } else if (message.type === "result") {
-        await this.processResultMessage(message, currentMessages);
-
-        // Extract token usage from result message (check both direct and nested locations)
-        const usage = (message as any).usage || (message as any).message?.usage;
-        if (usage) {
-          tokenUsage = {
-            inputTokens: usage.input_tokens || 0,
-            outputTokens: usage.output_tokens || 0,
-            cacheReadInputTokens: usage.cache_read_input_tokens,
-            cacheCreationInputTokens: usage.cache_creation_input_tokens,
-          };
-        }
-
-        // The SDK reports the full agentic-loop cost on the result message.
-        costUsd = message.total_cost_usd;
-
-        // Check for special responses in results too
-        const resultText =
-          (message as any).result || (message as any).message?.result;
-        if (
-          resultText &&
-          slackContext &&
-          (await this.channelConfig.isConditionalReplyChannel(
-            slackContext.channel,
-            slackContext.channelType,
-          ))
-        ) {
-          if (resultText.match(/DO_NOT_RESPOND/i)) {
-            shouldNotRespond = true;
-          }
-        }
+        if (await honorsDoNotRespond(event.result)) shouldNotRespond = true;
       }
     }
-
-    timings.claude_total_stream_ms = Date.now() - streamStart;
-
-    // Log completion summary with token usage and turn count
-    const completionLog: Record<string, unknown> = {
-      msgs: currentMessages.length,
-      tools: toolCalls.length,
-      turns: turnCount,
-    };
-    if (tokenUsage) {
-      completionLog.inputTokens = tokenUsage.inputTokens;
-      completionLog.outputTokens = tokenUsage.outputTokens;
-      if (tokenUsage.cacheReadInputTokens !== undefined) {
-        completionLog.cacheReadTokens = tokenUsage.cacheReadInputTokens;
-      }
-      if (tokenUsage.cacheCreationInputTokens !== undefined) {
-        completionLog.cacheCreationTokens = tokenUsage.cacheCreationInputTokens;
-      }
-    }
-    if (costUsd !== undefined) {
-      completionLog.costUsd = costUsd;
-    }
-    this.logger.info("✅ Completed", completionLog);
-
+    phaseTimings.provider_total_stream_ms = Date.now() - started;
+    messages.length = 0;
+    if (streamedText) messages.push(streamedText);
+    this.logger.info("✅ Completed", { msgs: messages.length, turns: turnCount });
     return {
-      messages: currentMessages,
+      messages,
       shouldNotRespond,
-      debugLogs: isDebugMode ? debugLogs : undefined,
-      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-      toolCallNames: toolCallNames.length > 0 ? toolCallNames : undefined,
-      confirmationDialogPosted: confirmationDialogPosted || undefined,
+      debugLogs: prompt.includes("[DEBUG]") ? debugLogs : undefined,
       tokenUsage,
       costUsd,
-      turnCount: turnCount > 0 ? turnCount : undefined,
-      phaseTimings: timings,
+      turnCount: turnCount || undefined,
+      phaseTimings,
     };
   }
 
-  /**
-   * Process assistant messages from Claude
-   */
-  private async processAssistantMessage(
-    message: SDKMessage,
-    currentMessages: string[],
-    sessionKey?: string,
-    slackContext?: SlackContext,
-    isDebugMode?: boolean,
-    debugLogs?: string[],
-    toolCallsTracking?: string[],
-    toolNamesTracking?: string[],
-    allowFullLogging?: boolean,
-  ): Promise<void> {
-    // Check if this is a tool use message
-    const hasToolUse = message.message.content?.some(
-      (part: any) => part.type === "tool_use",
-    );
-
-    if (hasToolUse) {
-      // Get tool names for logging
-      const toolCalls =
-        message.message.content
-          ?.filter((part: any) => part.type === "tool_use")
-          .map((part: any) => ({
-            name: part.name,
-            parameters: part.input || {},
-          })) || [];
-
-      // Skill invocations are logged as `Skill:<name>` so names-only tracking
-      // (DMs / private channels) still reveals which skill ran. The `skill`
-      // parameter is a fixed enumerated value, not user content.
-      const toolNames = toolCalls.map((t: any) =>
-        t.name === "Skill" && typeof t.parameters?.skill === "string"
-          ? `Skill:${t.parameters.skill}`
-          : t.name,
-      );
-
-      // Format tool call with params
-      const formatToolCall = (t: any) => {
-        const params = Object.entries(t.parameters ?? {})
-          .map(
-            ([k, v]) =>
-              `${k}=${truncateForLog(typeof v === "string" ? v : JSON.stringify(v), TOOL_CALL_PARAM_LOG_MAX_LENGTH)}`,
-          )
-          .join(", ");
-        return params ? `${t.name}(${params})` : `${t.name}()`;
-      };
-
-      const formattedCalls = toolCalls.map(formatToolCall);
-      const fullPreview = formattedCalls.join(" | ");
-
-      // Log with privacy handling: tool names are safe, params are sensitive
-      this.logSensitive(
-        "🔧",
-        { tools: toolNames },
-        fullPreview,
-        allowFullLogging ?? false,
-        isDebugMode,
-        debugLogs,
-      );
-      // Track individual tool calls for analytics (preserves correct count).
-      // Names-only list mirrors the formatted list so tracking can emit the
-      // safe variant for DMs / private channels.
-      if (toolCallsTracking) toolCallsTracking.push(...formattedCalls);
-      if (toolNamesTracking) toolNamesTracking.push(...toolNames);
-
-      if (
-        sessionKey &&
-        slackContext &&
-        (await this.shouldShowReactions(slackContext))
-      ) {
-        await this.reactionManager.updateReaction(
-          sessionKey,
-          REACTIONS.TOOL_USE,
-        );
-      }
-
-      // Extract any text content from tool use messages
-      const content = this.extractTextContent(message);
-      if (content) {
-        this.addSubstantialContent(content, currentMessages, "tool use");
-      }
-    } else {
-      // Handle regular text content
-      const content = this.extractTextContent(message);
-      if (content) {
-        this.addSubstantialContent(content, currentMessages, "assistant");
-      }
+  private processEvent(event: AgentStreamEvent, messages: string[], debugLogs: string[]): void {
+    if (event.type === "assistant") {
+      const text = event.message.content.map(part => part.text).join("");
+      if (text && !messages.includes(text)) messages.push(text);
+      return;
     }
+    // The assistant event is authoritative for text. The result is metadata,
+    // so never append its result and duplicate a streamed answer.
+    if (event.subtype === "error") debugLogs.push("Provider returned an error result");
   }
 
-  /**
-   * Process result messages from Claude
-   */
-  private async processResultMessage(
-    message: SDKMessage,
-    currentMessages: string[],
-  ): Promise<void> {
-    const messageData = (message as any).message || (message as any);
-    const isSuccessfulResult =
-      message.subtype === "success" ||
-      (message.subtype === "error_during_execution" && !messageData.is_error);
-
-    const resultText = (message as any).result || messageData.result;
-    if (isSuccessfulResult && resultText && currentMessages.length === 0) {
-      // Only add result if we don't already have text content from assistant messages
-      currentMessages.push(resultText);
-    }
-  }
-
-  /**
-   * Process tool result messages (user messages with tool_result content blocks)
-   */
-  private processToolResultMessage(
-    message: SDKMessage,
-    isDebugMode?: boolean,
-    debugLogs?: string[],
-    allowFullLogging?: boolean,
-  ):
-    | { confirmationDialogPosted?: boolean; shouldNotRespond?: boolean }
-    | undefined {
-    const content =
-      (message as any).message?.content || (message as any).content;
-    if (!Array.isArray(content)) return;
-
-    let suppressReply = false;
-    let dialogPosted = false;
-
-    for (const block of content) {
-      if (block.type === "tool_result") {
-        const raw = block.content;
-        const resultContent =
-          typeof raw === "string"
-            ? raw
-            : Array.isArray(raw)
-              ? raw.map((c: any) => c?.text || JSON.stringify(c)).join("")
-              : JSON.stringify(raw ?? "");
-
-        const preview = truncateForLog(
-          resultContent,
-          TOOL_RESPONSE_LOG_MAX_LENGTH,
-        );
-
-        // Log with privacy handling: server logs respect allowFullLogging, debug logs show full
-        this.logSensitive(
-          `📋 Result (${resultContent.length} chars):`,
-          {},
-          preview,
-          allowFullLogging ?? false,
-          isDebugMode,
-          debugLogs,
-        );
-
-        if (CUSTOM_ACTION_SUPPRESSES_REPLY.test(resultContent)) {
-          suppressReply = true;
-          if (/confirmation dialog has been posted/i.test(resultContent)) {
-            dialogPosted = true;
-          }
-        }
-      }
-    }
-
-    if (!suppressReply && !dialogPosted) return;
-    return {
-      confirmationDialogPosted: dialogPosted || undefined,
-      shouldNotRespond: suppressReply || undefined,
-    };
-  }
-
-  /**
-   * Extract text content from Claude message
-   */
-  private extractTextContent(message: SDKMessage): string | null {
-    if (message.type === "assistant" && message.message.content) {
-      const textParts = message.message.content
-        .filter((part: any) => part.type === "text")
-        .map((part: any) => part.text);
-
-      const content = textParts.join("");
-      return content || null;
-    }
-    return null;
-  }
-
-  /**
-   * Add substantial content to messages array (filtering out intermediate steps)
-   */
-  private addSubstantialContent(
-    content: string,
-    messages: string[],
-    sourceType: string,
-  ): void {
-    const minLength = sourceType === "tool use" ? 300 : 500;
-    const isSubstantialContent =
-      content.length > minLength &&
-      (content.includes("##") ||
-        content.includes("###") ||
-        content.includes("Action Plan"));
-    const isIntermediateStep = content.match(/^(Now let me|Let me|I'll)/i);
-
-    if (
-      !messages.includes(content) &&
-      isSubstantialContent &&
-      !isIntermediateStep
-    ) {
-      messages.push(content);
-    }
+  private async shouldShowReactions(context: SlackContext): Promise<boolean> {
+    const ephemeral = await this.channelConfig.shouldUseEphemeralMessaging(context.channel);
+    return !(ephemeral && !context.explicitMention &&
+      (await this.channelConfig.getEphemeralTargetUsers(context.channel)).length > 0);
   }
 }

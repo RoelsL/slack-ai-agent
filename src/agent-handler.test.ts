@@ -9,7 +9,7 @@ jest.mock("./config", () => ({
       appToken: "xapp-test",
       signingSecret: "test-secret",
     },
-    anthropic: { apiKey: "test-key", model: "claude-opus-4-8" },
+    litellm: { baseUrl: "http://localhost:4000/v1", apiKey: "test-key", model: "test-model", requestTimeoutMs: 120000 },
     slackWorkspaceUrl: "https://test.slack.com",
     baseDirectory: "/tmp/slack-ai-agent",
     persistDir: "/tmp/test-persist",
@@ -27,50 +27,232 @@ jest.mock("./validation-agent", () => ({
   loadSubagentDefinitions: jest.fn(() => ({})),
 }));
 
-import fs from "fs";
-import os from "os";
-import path from "path";
 import {
-  ClaudeHandler,
+  AgentHandler,
   DEFAULT_SESSION_MAX_AGE_MS,
-  shouldInjectActions,
-  buildSanitizedEnv,
-} from "./claude-handler";
+} from "./agent-handler";
 import {
   destroyThreadWorkspace,
   buildSandboxFilesystem,
   SANDBOX_FILESYSTEM,
   SANDBOX_NETWORK,
 } from "./config";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import type { ProviderChatRequest, ProviderStreamChunk } from "./agent-types";
+import type { ConversationSession } from "./types";
 
-function createHandler(retryOverrides?: {
-  maxRetries?: number;
-  initialDelayMs?: number;
-  backoffMultiplier?: number;
-}): ClaudeHandler {
-  const mockMcpManager = {
-    getServerConfiguration: jest.fn().mockReturnValue({}),
-    getAllowedTools: jest.fn().mockResolvedValue([]),
-    getDisallowedTools: jest.fn().mockReturnValue([]),
-    getHighestRole: jest.fn().mockResolvedValue("admin"),
-  } as any;
+async function collect<T>(stream: AsyncGenerator<T>): Promise<T[]> {
+  const values: T[] = [];
+  for await (const value of stream) values.push(value);
+  return values;
+}
 
-  const handler = new ClaudeHandler(mockMcpManager);
+interface FakeClient {
+  streamChat: jest.MockedFunction<
+    (request: ProviderChatRequest) => AsyncGenerator<ProviderStreamChunk>
+  >;
+}
+
+function createHandler(
+  client?: FakeClient,
+  retryOverrides?: {
+    maxRetries?: number;
+    initialDelayMs?: number;
+    backoffMultiplier?: number;
+  },
+): AgentHandler {
+  const handler = new AgentHandler(client);
 
   if (retryOverrides) {
-    (handler as any).retryOptions = {
-      maxRetries: retryOverrides.maxRetries ?? 3,
-      initialDelayMs: retryOverrides.initialDelayMs ?? 1,
-      backoffMultiplier: retryOverrides.backoffMultiplier ?? 1,
-    };
+    handler.retryOptions.maxRetries = retryOverrides.maxRetries ?? 3;
+    handler.retryOptions.initialDelayMs = retryOverrides.initialDelayMs ?? 1;
+    handler.retryOptions.backoffMultiplier =
+      retryOverrides.backoffMultiplier ?? 1;
   }
 
   return handler;
 }
 
-describe("ClaudeHandler", () => {
+describe("AgentHandler", () => {
+  function streamOf(...chunks: ProviderStreamChunk[]): AsyncGenerator<ProviderStreamChunk> {
+    return (async function* () {
+      yield* chunks;
+    })();
+  }
+
+  function fakeClient(
+    streams: Array<AsyncGenerator<ProviderStreamChunk> | Error>,
+  ): FakeClient {
+    return {
+      streamChat: jest.fn(async function* (_request: ProviderChatRequest) {
+        const next = streams.shift();
+        if (next instanceof Error) throw next;
+        if (next) yield* next;
+      }),
+    };
+  }
+
+  function completedSession(handler: AgentHandler): ConversationSession {
+    return handler.createSession("U1", "C1", "T1");
+  }
+
+  it("uses committed history on the second request", async () => {
+    const client = fakeClient([
+      streamOf({ text: "first" }),
+      streamOf({ text: "second" }),
+    ]);
+    const handler = createHandler(client);
+    const session = completedSession(handler);
+
+    await collect(handler.streamQuery("one", session, undefined, undefined, undefined, undefined, "rules"));
+    await collect(handler.streamQuery("two", session, undefined, undefined, undefined, undefined, "rules"));
+
+    expect(client.streamChat.mock.calls[1][0].messages).toEqual([
+      { role: "system", content: "rules" },
+      { role: "user", content: "one" },
+      { role: "assistant", content: "first" },
+      { role: "user", content: "two" },
+    ]);
+  });
+
+  it("replaces a changed system message", async () => {
+    const client = fakeClient([streamOf({ text: "one" }), streamOf({ text: "two" })]);
+    const handler = createHandler(client);
+    const session = completedSession(handler);
+
+    await collect(handler.streamQuery("one", session, undefined, undefined, undefined, undefined, "old"));
+    await collect(handler.streamQuery("two", session, undefined, undefined, undefined, undefined, "new"));
+
+    expect(client.streamChat.mock.calls[1][0].messages).toEqual([
+      { role: "system", content: "new" },
+      { role: "user", content: "one" },
+      { role: "assistant", content: "one" },
+      { role: "user", content: "two" },
+    ]);
+    expect(session.history.filter(message => message.role === "system")).toHaveLength(1);
+  });
+
+  it("does not retry aborts or commit partial output", async () => {
+    const controller = new AbortController();
+    const client: FakeClient = {
+      streamChat: jest.fn(async function* (_request: ProviderChatRequest) {
+        yield { text: "partial" };
+        controller.abort();
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      }),
+    };
+    const handler = createHandler(client);
+    const session = completedSession(handler);
+
+    await expect(collect(handler.streamQuery("query", session, controller))).rejects.toThrow("aborted");
+    expect(client.streamChat).toHaveBeenCalledTimes(1);
+    expect(session.history).toEqual([]);
+  });
+
+  it("retries streaming failures without duplicating the current user", async () => {
+    const client = fakeClient([
+      new Error("temporary"),
+      streamOf({ text: "recovered" }),
+    ]);
+    const handler = createHandler(client, { maxRetries: 1, initialDelayMs: 1, backoffMultiplier: 1 });
+    const session = completedSession(handler);
+
+    await collect(handler.streamQuery("once", session));
+    expect(client.streamChat).toHaveBeenCalledTimes(2);
+    expect(client.streamChat.mock.calls[0][0].messages).toEqual([
+      { role: "user", content: "once" },
+    ]);
+    expect(client.streamChat.mock.calls[1][0].messages).toEqual([
+      { role: "user", content: "once" },
+    ]);
+    expect(session.history).toEqual([
+      { role: "user", content: "once" },
+      { role: "assistant", content: "recovered" },
+    ]);
+  });
+
+  it("aborts retry sleep without issuing another provider call", async () => {
+    const controller = new AbortController();
+    const client = fakeClient([new Error("temporary"), streamOf({ text: "late" })]);
+    const handler = createHandler(client, {
+      maxRetries: 1,
+      initialDelayMs: 100,
+      backoffMultiplier: 1,
+    });
+    const session = completedSession(handler);
+    const retry = jest.fn();
+
+    const pending = collect(
+      handler.streamQuery(
+        "query",
+        session,
+        controller,
+        undefined,
+        undefined,
+        retry,
+      ),
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(client.streamChat).toHaveBeenCalledTimes(1);
+    expect(session.history).toEqual([]);
+  });
+
+  it("uses only an exact configured model and ignores unsupported mode fields", async () => {
+    const client = fakeClient([streamOf({ text: "ok" }), streamOf({ text: "ok" })]);
+    const handler = createHandler(client);
+    const session = completedSession(handler);
+
+    await collect(handler.streamQuery("x", session, undefined, undefined, undefined, undefined, undefined, {
+      model: "other-model",
+      effort: "high",
+      fast: true,
+    }));
+    await collect(handler.streamQuery("y", session, undefined, undefined, undefined, undefined, undefined, {
+      model: "test-model",
+      effort: "low",
+      fast: true,
+    }));
+
+    expect(client.streamChat.mock.calls[0][0].model).toBe("test-model");
+    expect(client.streamChat.mock.calls[1][0].model).toBe("test-model");
+    expect(client.streamChat.mock.calls[0][0]).not.toHaveProperty("effort");
+    expect(client.streamChat.mock.calls[0][0]).not.toHaveProperty("fast");
+  });
+
+  it("keeps only nine prior pairs in a request and ten after commit", async () => {
+    const client = fakeClient([streamOf({ text: "new-answer" })]);
+    const handler = createHandler(client);
+    const session = completedSession(handler);
+    session.history = [{ role: "system", content: "rules" }];
+    for (let i = 1; i <= 10; i++) {
+      session.history.push({ role: "user", content: `user-${i}` });
+      session.history.push({ role: "assistant", content: `assistant-${i}` });
+    }
+
+    await collect(handler.streamQuery("current", session));
+    const request = client.streamChat.mock.calls[0][0].messages;
+    expect(request).toHaveLength(1 + 18 + 1);
+    expect(request[1]).toEqual({ role: "user", content: "user-2" });
+    expect(request[request.length - 1]).toEqual({
+      role: "user",
+      content: "current",
+    });
+    expect(session.history).toHaveLength(1 + 20);
+    expect(session.history[1]).toEqual({ role: "user", content: "user-2" });
+    expect(session.history[session.history.length - 1]).toEqual({
+      role: "assistant",
+      content: "new-answer",
+    });
+  });
+
   describe("getSessionKey", () => {
-    let handler: ClaudeHandler;
+    let handler: AgentHandler;
     beforeEach(() => {
       handler = createHandler();
     });
@@ -91,7 +273,7 @@ describe("ClaudeHandler", () => {
   });
 
   describe("session lifecycle", () => {
-    let handler: ClaudeHandler;
+    let handler: AgentHandler;
     beforeEach(() => {
       handler = createHandler();
     });
@@ -134,7 +316,7 @@ describe("ClaudeHandler", () => {
   });
 
   describe("cleanupInactiveSessions", () => {
-    let handler: ClaudeHandler;
+    let handler: AgentHandler;
     beforeEach(() => {
       handler = createHandler();
       jest.mocked(destroyThreadWorkspace).mockClear();
@@ -196,9 +378,9 @@ describe("ClaudeHandler", () => {
   });
 
   describe("simpleRetry", () => {
-    let handler: ClaudeHandler;
+    let handler: AgentHandler;
     beforeEach(() => {
-      handler = createHandler({
+      handler = createHandler(undefined, {
         maxRetries: 3,
         initialDelayMs: 1, // 1ms delays for fast tests
         backoffMultiplier: 1,
@@ -207,7 +389,7 @@ describe("ClaudeHandler", () => {
 
     it("returns on first success", async () => {
       const op = jest.fn().mockResolvedValue("ok");
-      const result = await (handler as any).simpleRetry(op);
+      const result = await handler.simpleRetry(op);
       expect(result).toBe("ok");
       expect(op).toHaveBeenCalledTimes(1);
     });
@@ -219,7 +401,7 @@ describe("ClaudeHandler", () => {
         .mockRejectedValueOnce(new Error("fail2"))
         .mockResolvedValue("ok");
 
-      const result = await (handler as any).simpleRetry(op);
+      const result = await handler.simpleRetry(op);
       expect(result).toBe("ok");
       expect(op).toHaveBeenCalledTimes(3);
     });
@@ -227,7 +409,7 @@ describe("ClaudeHandler", () => {
     it("throws after exhausting all retries", async () => {
       const op = jest.fn().mockRejectedValue(new Error("always fails"));
 
-      await expect((handler as any).simpleRetry(op)).rejects.toThrow(
+      await expect(handler.simpleRetry(op)).rejects.toThrow(
         "always fails",
       );
       // 1 initial + 3 retries = 4 calls
@@ -239,7 +421,7 @@ describe("ClaudeHandler", () => {
       abortError.name = "AbortError";
       const op = jest.fn().mockRejectedValue(abortError);
 
-      await expect((handler as any).simpleRetry(op)).rejects.toThrow("Aborted");
+      await expect(handler.simpleRetry(op)).rejects.toThrow("Aborted");
       expect(op).toHaveBeenCalledTimes(1);
     });
 
@@ -251,7 +433,7 @@ describe("ClaudeHandler", () => {
         .mockResolvedValue("ok");
 
       const onRetry = jest.fn();
-      await (handler as any).simpleRetry(op, onRetry);
+      await handler.simpleRetry(op, onRetry);
 
       expect(onRetry).toHaveBeenCalledTimes(2);
       expect(onRetry).toHaveBeenNthCalledWith(1, 1);
@@ -261,19 +443,19 @@ describe("ClaudeHandler", () => {
     it("does not call onRetry on first success", async () => {
       const op = jest.fn().mockResolvedValue("ok");
       const onRetry = jest.fn();
-      await (handler as any).simpleRetry(op, onRetry);
+      await handler.simpleRetry(op, onRetry);
       expect(onRetry).not.toHaveBeenCalled();
     });
 
     it("applies exponential backoff delays", async () => {
-      const customHandler = createHandler({
+      const customHandler = createHandler(undefined, {
         maxRetries: 2,
         initialDelayMs: 10,
         backoffMultiplier: 2,
       });
 
       const sleepSpy = jest
-        .spyOn(customHandler as any, "sleep")
+        .spyOn(customHandler, "sleep")
         .mockResolvedValue(undefined);
 
       const op = jest
@@ -282,7 +464,7 @@ describe("ClaudeHandler", () => {
         .mockRejectedValueOnce(new Error("fail"))
         .mockResolvedValue("ok");
 
-      await (customHandler as any).simpleRetry(op);
+      await customHandler.simpleRetry(op);
 
       // attempt 0 fails → delay = 10 * 2^0 = 10ms
       // attempt 1 fails → delay = 10 * 2^1 = 20ms
@@ -293,103 +475,6 @@ describe("ClaudeHandler", () => {
   });
 });
 
-describe("shouldInjectActions", () => {
-  const base = {
-    channelType: "channel" as const,
-    explicitMention: false,
-    workflowId: undefined as string | undefined,
-    isNonEphemeralConditionalChannel: false,
-  };
-
-  it("returns true for DMs", () => {
-    expect(shouldInjectActions({ ...base, channelType: "im" })).toBe(true);
-  });
-
-  it("returns true for explicit mentions", () => {
-    expect(shouldInjectActions({ ...base, explicitMention: true })).toBe(true);
-  });
-
-  it("returns true for workflow-triggered messages", () => {
-    expect(shouldInjectActions({ ...base, workflowId: "WF123" })).toBe(true);
-  });
-
-  it("returns true for non-ephemeral conditional channels", () => {
-    expect(
-      shouldInjectActions({ ...base, isNonEphemeralConditionalChannel: true }),
-    ).toBe(true);
-  });
-
-  it("returns false for regular channel messages", () => {
-    expect(shouldInjectActions(base)).toBe(false);
-  });
-
-  it("returns false for group channels without triggers", () => {
-    expect(shouldInjectActions({ ...base, channelType: "group" })).toBe(false);
-  });
-});
-
-describe("buildSanitizedEnv", () => {
-  const originalEnv = process.env;
-
-  beforeEach(() => {
-    process.env = {
-      PATH: "/usr/bin",
-      HOME: "/home/user",
-      ANTHROPIC_API_KEY: "sk-ant-test",
-      AWS_ACCESS_KEY_ID: "AKIA-test",
-      AWS_SECRET_ACCESS_KEY: "aws-secret-test",
-      AWS_SESSION_TOKEN: "aws-session-test",
-      AWS_REGION: "us-east-1",
-      AWS_PROFILE: "test-profile",
-      CC_SLACK_BOT_TOKEN: "xoxb-secret",
-      CC_SLACK_APP_TOKEN: "xapp-secret",
-      CC_SLACK_SIGNING_SECRET: "signing-secret",
-      GLEAN_API_TOKEN: "glean-secret",
-      GIT_LINK_HMAC_SECRET: "hmac-secret",
-    };
-  });
-
-  afterEach(() => {
-    process.env = originalEnv;
-  });
-
-  it("includes allowed env vars and AWS credentials", () => {
-    const env = buildSanitizedEnv();
-    expect(Object.keys(env).sort()).toEqual([
-      "ANTHROPIC_API_KEY",
-      "AWS_ACCESS_KEY_ID",
-      "AWS_PROFILE",
-      "AWS_REGION",
-      "AWS_SECRET_ACCESS_KEY",
-      "AWS_SESSION_TOKEN",
-      "HOME",
-      "PATH",
-    ]);
-  });
-
-  it("excludes all other secrets", () => {
-    const env = buildSanitizedEnv();
-    expect(env.CC_SLACK_BOT_TOKEN).toBeUndefined();
-    expect(env.CC_SLACK_APP_TOKEN).toBeUndefined();
-    expect(env.CC_SLACK_SIGNING_SECRET).toBeUndefined();
-    expect(env.GLEAN_API_TOKEN).toBeUndefined();
-    expect(env.GIT_LINK_HMAC_SECRET).toBeUndefined();
-  });
-
-  it("omits AWS vars that are not set in the environment", () => {
-    delete process.env.AWS_PROFILE;
-    delete process.env.AWS_SESSION_TOKEN;
-    const env = buildSanitizedEnv();
-    expect(env.AWS_PROFILE).toBeUndefined();
-    expect(env.AWS_SESSION_TOKEN).toBeUndefined();
-    expect(env.AWS_ACCESS_KEY_ID).toBe("AKIA-test");
-  });
-
-  it("passes MCP_TOOL_TIMEOUT through when set", () => {
-    process.env.MCP_TOOL_TIMEOUT = "180000";
-    expect(buildSanitizedEnv().MCP_TOOL_TIMEOUT).toBe("180000");
-  });
-});
 
 describe("SANDBOX_FILESYSTEM", () => {
   // Regression guard: the `bq` CLI refreshes its OAuth token cache into
@@ -402,7 +487,7 @@ describe("SANDBOX_FILESYSTEM", () => {
 
   it("keeps the rest of $HOME unreadable so repo secrets stay hidden", () => {
     expect(SANDBOX_FILESYSTEM.denyRead).toContain("~/");
-    // The sandbox cwd stays writable for the agent's own scratch files.
+    // Legacy helper data is retained for later tool sessions.
     expect(SANDBOX_FILESYSTEM.allowWrite).toContain("/tmp/slack-ai-agent");
   });
 
@@ -413,7 +498,7 @@ describe("SANDBOX_FILESYSTEM", () => {
     expect(rules.denyRead).toEqual(SANDBOX_FILESYSTEM.denyRead);
   });
 
-  // The CLI persists oversized tool outputs under
+  // A future local tool runner may persist oversized outputs under
   // ~/.claude/projects/<slugified-cwd>/ and tells the agent to read them
   // back from there. The slug is per thread workspace, so other threads'
   // session artifacts stay hidden behind the $HOME denyRead.
@@ -428,7 +513,7 @@ describe("SANDBOX_FILESYSTEM", () => {
     ]);
   });
 
-  // The CLI slugs its *resolved* cwd, so when the workspace path contains a
+  // A future runner may slug its resolved cwd, so when the workspace path contains a
   // symlink (macOS /tmp → /private/tmp) the persisted outputs land under the
   // physical path's slug, which must be readable too.
   it("also lets the agent read the project dir of a symlink-resolved cwd", () => {
@@ -453,7 +538,7 @@ describe("SANDBOX_FILESYSTEM", () => {
 });
 
 describe("SANDBOX_NETWORK", () => {
-  // The bash sandbox only reaches managed domains by default, so the `bq` and
+  // Deferred network rules include endpoints the future `bq` and
   // `aws` CLIs the data skills shell out to need these endpoints allowlisted:
   // `bq` refreshes its OAuth token against googleapis.com, and `aws` reads
   // instance-profile credentials from the IMDS link-local address.

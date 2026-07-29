@@ -1,11 +1,10 @@
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
-import { OPUS_MODEL } from "./request-mode";
 
 dotenv.config();
 
-function getRequiredEnv(key: string): string {
+export function getRequiredEnv(key: string): string {
   const value = process.env[key];
   if (!value) {
     throw new Error(`Missing required environment variable: ${key}`);
@@ -13,12 +12,20 @@ function getRequiredEnv(key: string): string {
   return value;
 }
 
-// The Claude Agent SDK's working directory lives under /tmp so the agent
-// never reads from or writes to the application directory.  Each Slack
-// thread gets its own subdirectory under workspaces/ with copies of
-// .claude/ and data/ physically inside the sandbox (symlinks get resolved
-// to the real path which is outside the sandbox, causing security blocks
-// on grep/Read/Glob).
+export function parsePositiveTimeoutEnv(key: string): number {
+  const value = getRequiredEnv(key);
+  if (!/^\d+(?:\.\d+)?$/.test(value)) {
+    throw new Error(`Invalid environment variable: ${key}`);
+  }
+  const timeout = Number(value);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new Error(`Invalid environment variable: ${key}`);
+  }
+  return timeout;
+}
+
+// Legacy/deferred workspace preparation retained for later tool sessions. It
+// does not establish a sandbox and is not used to enforce provider isolation.
 export const SANDBOX_ROOT = "/tmp/slack-ai-agent";
 const WORKSPACES_DIR = path.join(SANDBOX_ROOT, "workspaces");
 
@@ -82,7 +89,7 @@ export function destroyThreadWorkspace(sessionKey: string): void {
 }
 
 /**
- * Filesystem rules for the Bash sandbox.
+ * Legacy/deferred filesystem rules for a future command sandbox.
  *
  * Denies reading $HOME (where the repo and resolved mcp-servers.json secrets
  * live) and carves out ~/.config/gcloud for bq CLI auth. That dir must be
@@ -95,8 +102,8 @@ const SANDBOX_FILESYSTEM_RULES = {
 } as const;
 
 /**
- * Per-cwd Claude project dirs (~/.claude/projects/<slug>). When a tool result
- * exceeds the output token limit, the Claude CLI persists it under
+ * Per-cwd deferred tool-output dirs (~/.claude/projects/<slug>). When a tool result
+ * exceeds the output token limit, a future local tool runner may persist it under
  * <project>/<session>/tool-results/ and points the agent at that path, so
  * the dir must be readable despite the $HOME denyRead. The slug mirrors the
  * CLI's own project-dir naming (every non-alphanumeric character becomes
@@ -119,7 +126,7 @@ const claudeProjectDirs = (workingDirectory: string): string[] => {
   );
 };
 
-/** Bash sandbox filesystem rules scoped to a thread workspace cwd. */
+/** Deferred command-sandbox filesystem rules scoped to a thread workspace cwd. */
 export const buildSandboxFilesystem = (workingDirectory: string) => ({
   denyRead: [...SANDBOX_FILESYSTEM_RULES.denyRead],
   allowRead: [
@@ -129,12 +136,11 @@ export const buildSandboxFilesystem = (workingDirectory: string) => ({
   allowWrite: [workingDirectory, "~/.config/gcloud"],
 });
 
-/** Default rules for tests; allowWrite covers the whole sandbox root. */
+/** Default deferred rules for tests; not enforced by Session 1 inference. */
 export const SANDBOX_FILESYSTEM = buildSandboxFilesystem(SANDBOX_ROOT);
 
 /**
- * Network rules for the Bash sandbox. Adds the Google Cloud and AWS endpoints
- * the data-skill CLIs need on top of the SDK's managed domains.
+ * Deferred network rules for a future command sandbox.
  */
 export const SANDBOX_NETWORK = {
   allowedDomains: ["*.googleapis.com", "*.amazonaws.com", "169.254.169.254"],
@@ -146,15 +152,13 @@ export const config = {
     appToken: getRequiredEnv("CC_SLACK_APP_TOKEN"),
     signingSecret: getRequiredEnv("CC_SLACK_SIGNING_SECRET"),
   },
-  anthropic: {
-    apiKey: getRequiredEnv("ANTHROPIC_API_KEY"),
-    model: OPUS_MODEL, // Claude 4.8 Opus - most capable model
+  litellm: {
+    baseUrl: getRequiredEnv("LITELLM_BASE_URL"),
+    apiKey: getRequiredEnv("LITELLM_API_KEY"),
+    model: getRequiredEnv("LITELLM_MODEL"),
+    requestTimeoutMs: parsePositiveTimeoutEnv("LITELLM_REQUEST_TIMEOUT_MS"),
   },
   slackWorkspaceUrl: getRequiredEnv("SLACK_WORKSPACE_URL"),
-  // Optional Slack channel for operational alerts (e.g. model fallback). When
-  // unset, no ops notifications are sent. Set OPS_ALERT_CHANNEL_ID in the
-  // deployment environment to enable them.
-  opsAlertChannelId: process.env.OPS_ALERT_CHANNEL_ID || undefined,
   trackingClientId: process.env.TRACKING_CLIENT_ID || "slack-ai-agent",
   baseDirectory: ensureSandboxRoot(),
   // Persistent state that must survive process restarts (deploys).

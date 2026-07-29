@@ -1,10 +1,8 @@
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
-export type AllowedModel =
-  | "claude-opus-4-8"
-  | "claude-sonnet-5"
-  | "claude-haiku-4-5"
-  | "claude-fable-5";
+/** Model aliases remain edge configuration values; the provider accepts only
+ * an exact match for the configured LiteLLM deployment ID. */
+export type AllowedModel = string;
 
 export interface RequestMode {
   model?: AllowedModel;
@@ -15,9 +13,9 @@ export interface RequestMode {
 export interface ChannelModeConfig {
   model?: AllowedModel;
   effort?: EffortLevel;
-  /** Regex tested against message text; fast mode activates on match. Use ".*" for always-on. */
+  /** Legacy edge trigger; provider-specific fast mode is not forwarded. */
   fastModePattern?: string;
-  /** Fast mode activates when the user @-mentions the bot. */
+  /** Legacy edge trigger; provider-specific fast mode is not forwarded. */
   fastModeTagBot?: boolean;
 }
 
@@ -71,8 +69,7 @@ const MODE_TIERS: {
 const supportsEffort = (model: string | undefined): boolean =>
   !model?.toLowerCase().includes("haiku");
 
-// Fast mode is Opus-only. `undefined` means the default model (Opus), so it
-// qualifies; any explicitly pinned non-Opus model does not.
+// Preserve the edge trigger behavior while the provider ignores fast mode.
 const supportsFastMode = (model: string | undefined): boolean =>
   model === undefined || model.toLowerCase().includes("opus");
 

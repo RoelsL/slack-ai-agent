@@ -148,8 +148,8 @@ export class FileHandler {
   }
 
   /**
-   * Format files into a prompt string for Claude
-   * All files are passed by path - Claude Code will use its Read tool to access content
+   * Format uploaded files into a prompt string for the configured provider.
+   * Local file tools are intentionally deferred to a later migration session.
    * @param files - Array of processed files to format
    * @returns Formatted string with file information
    */
@@ -164,7 +164,7 @@ export class FileHandler {
     );
 
     return (
-      "The following files have been uploaded. Use the Read tool to access their contents:\n" +
+      "The following files have been uploaded and are available at the listed paths:\n" +
       parts.join("\n")
     );
   }

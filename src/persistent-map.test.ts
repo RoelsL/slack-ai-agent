@@ -1,7 +1,7 @@
 jest.mock("./config", () => ({
   config: {
     slack: { botToken: "xoxb-test", appToken: "xapp-test", signingSecret: "s" },
-    anthropic: { apiKey: "test-key", model: "claude-opus-4-8" },
+    litellm: { baseUrl: "http://localhost:4000/v1", apiKey: "test-key", model: "test-model", requestTimeoutMs: 120000 },
     slackWorkspaceUrl: "https://test.slack.com",
     baseDirectory: "/tmp/test",
     persistDir: "/tmp/test-persist",

@@ -2,23 +2,20 @@
 import { config } from "./config";
 import "./tracing";
 import { App } from "@slack/bolt";
-import { ClaudeHandler } from "./claude-handler";
+import { AgentHandler } from "./agent-handler";
 import { SlackHandler } from "./slack-handler";
-import { McpManager } from "./mcp-manager";
 import { ReactionManager } from "./reaction-manager";
-import { CustomActionRegistry, loadCustomActions } from "./custom-actions";
-import { startActiveWorkflowCleanup } from "../config/custom-actions/create-pr-via-temporal";
+// import { startActiveWorkflowCleanup } from "../config/custom-actions/create-pr-via-temporal";
 import { Logger } from "./logger";
 import { UserUtils } from "./user-utils";
 import { initTracking } from "./tracking";
 import { ChannelConfigManager } from "./channel-config";
-import { OpusHealthMonitor, buildSlackNotify } from "./opus-health";
 
 const logger = new Logger("Main");
 
 async function start() {
   try {
-    logger.info("Starting Claude Code Slack app", {
+    logger.info("Starting LiteLLM Slack app", {
       debug: config.debug,
     });
 
@@ -29,35 +26,16 @@ async function start() {
       appToken: config.slack.appToken,
     });
 
-    const mcpManager = new McpManager();
-    const mcpConfig = mcpManager.loadConfiguration();
     const channelConfigManager = new ChannelConfigManager();
     channelConfigManager.setApp(app);
     initTracking(app, channelConfigManager);
 
     const reactionManager = new ReactionManager(app);
 
-    const registry = new CustomActionRegistry(app, reactionManager);
-    const actions = await loadCustomActions();
-    for (const action of actions) {
-      registry.register(action);
-    }
-    registry.setupButtonHandlers();
-    registry.startSessionCleanup();
-    startActiveWorkflowCleanup();
-
-    const opusHealthMonitor = new OpusHealthMonitor({
-      notify: buildSlackNotify(app, config.opsAlertChannelId),
-    });
-
-    const claudeHandler = new ClaudeHandler(
-      mcpManager,
-      registry,
-      opusHealthMonitor,
-    );
+    const agentHandler = new AgentHandler();
     const slackHandler = new SlackHandler(
       app,
-      claudeHandler,
+      agentHandler,
       reactionManager,
       channelConfigManager,
     );
@@ -99,13 +77,12 @@ async function start() {
     await app.start();
     UserUtils.startCleanupInterval();
 
-    logger.info("⚡️ Claude Code Slack app is running!", {});
+    logger.info("⚡️ LiteLLM Slack app is running!", {});
     logger.info("Configuration:", {
       debugMode: config.debug,
       baseDirectory: config.baseDirectory,
-      mcpServers: mcpConfig ? Object.keys(mcpConfig.mcpServers).length : 0,
-      mcpServerNames: mcpConfig ? Object.keys(mcpConfig.mcpServers) : [],
-      customActions: actions.length,
+      inference: "LiteLLM text streaming",
+      tools: "disabled in Session 1",
     });
   } catch (error) {
     logger.error("Failed to start the bot", error);

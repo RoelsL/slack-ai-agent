@@ -1,12 +1,14 @@
 # Slack AI Agent
 
-A Slack app powered by Claude Code SDK. Responds in DMs, channels, and @-mentions with streaming responses, thread context, file uploads, and extensible MCP tool integrations.
+A Slack app powered by a provider-neutral LiteLLM proxy. Responds in DMs, channels, and @-mentions with streaming responses, thread context, and file uploads. Session 1 has no MCP, custom-action, local-tool, skill, subagent, or sandbox execution.
 
 ## Architecture
 
 - **`src/slack-handler.ts`** - Message routing and event handling
-- **`src/claude-handler.ts`** - Session management and Claude Code SDK integration
-- **`src/mcp-manager.ts`** - MCP server configuration and tool management
+- **`src/agent-handler.ts`** - Session management and LiteLLM text streaming
+- **`src/litellm-client.ts`** - Typed OpenAI-compatible HTTP/SSE client
+- **`src/agent-types.ts`** - Provider-neutral stream and transcript types
+- **`src/mcp-manager.ts`** - Deferred MCP configuration support; inactive in Session 1
 - **`src/message-processor.ts`** - Stream processing and response formatting
 - **`src/tracking.ts`** - Analytics tracking for message processing and feedback
 - **`src/channel-config.ts`** - Channel-specific context and configuration management
@@ -38,6 +40,17 @@ cp .env.example .env
 
 Fill in your tokens. See `.env.example` for all available variables.
 
+Inference requires `LITELLM_BASE_URL`, `LITELLM_API_KEY`, `LITELLM_MODEL`, and
+`LITELLM_REQUEST_TIMEOUT_MS`. The proxy must expose the OpenAI-compatible
+`/v1/chat/completions` streaming endpoint. The base URL may include or omit
+`/v1`; it is normalized once by the client.
+
+Conversation history is in-memory for the process lifetime and isolated per
+Slack user/channel/thread session. Requests include one current system prompt,
+up to the latest nine complete prior user/assistant pairs, and the current user
+turn. Successful transcripts retain the system prompt and latest 10 complete
+pairs. History is not persisted across restarts.
+
 ### 4. Configure the Bot
 
 Copy the example configs and customize for your workspace:
@@ -51,16 +64,16 @@ Copy the example configs and customize for your workspace:
 | `config/example-tool-denylist.yaml`               | `config/tool-denylist.yaml`               | Tools the bot must never use                                |
 | `config/instructions/example-general-context.txt` | `config/instructions/general-context.txt` | Base system prompt injected into every response             |
 
-#### Optional
+#### Deferred / unsupported in Session 1
 
 | Example file                                             | Copy to                               | Purpose                                                                |
 | --------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
 | `config/example-channels.yaml`                           | `config/channels.yaml`                | Channel auto-reply routing, keyword triggers, ephemeral summaries      |
 | `config/instructions/example-channel.txt`                | `config/instructions/<name>.txt`      | Channel-specific system prompt context (referenced by `channels.yaml`) |
-| `config/subagents/example-subagents.yaml`                | `config/subagents/<name>.yaml`        | Sub-agents for validation or post-processing                           |
-| `config/approvable-actions/example-approvable-action.ts` | `config/approvable-actions/<name>.ts` | Human-in-the-loop actions (auto-discovered)                            |
+| `config/subagents/example-subagents.yaml`                | Not active                           | Deferred sub-agent configuration                                       |
+| `config/approvable-actions/example-approvable-action.ts` | Not active                           | Deferred custom actions                                                |
 | `data/example-employees.yaml`                            | `data/employees.yaml`                 | Employee directory for role assignment and people lookups              |
-| `mcp-servers.example.json`                               | `mcp-servers.json`                    | MCP server connections (GitHub, Slack, Jenkins, etc.)                  |
+| `mcp-servers.example.json`                               | Not active                           | Deferred MCP server configuration                                      |
 
 Quick start:
 

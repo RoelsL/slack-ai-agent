@@ -14,7 +14,7 @@ jest.mock("./config", () => ({
       appToken: "xapp-test",
       signingSecret: "test-secret",
     },
-    anthropic: { apiKey: "test-key", model: "claude-opus-4-8" },
+    litellm: { baseUrl: "http://localhost:4000/v1", apiKey: "test-key", model: "test-model", requestTimeoutMs: 120000 },
     slackWorkspaceUrl: "https://test.slack.com",
     baseDirectory: "/tmp/test",
     persistDir: "/tmp/test-persist",
@@ -88,7 +88,7 @@ import { UserUtils } from "./user-utils";
 interface TestHarness {
   handler: SlackHandler;
   app: any;
-  claudeHandler: any;
+  agentHandler: any;
   reactionManager: any;
   channelConfig: any;
 }
@@ -116,7 +116,7 @@ function createHandler(): TestHarness {
     action: jest.fn(),
   } as any;
 
-  const mockClaudeHandler = {
+  const mockAgentHandler = {
     getSessionKey: jest.fn(
       (user: string, channel: string, threadTs: string) =>
         `${user}:${channel}:${threadTs}`,
@@ -136,7 +136,7 @@ function createHandler(): TestHarness {
 
   const handler = new SlackHandler(
     mockApp,
-    mockClaudeHandler,
+    mockAgentHandler,
     mockReactionManager,
     mockChannelConfig,
   );
@@ -146,7 +146,7 @@ function createHandler(): TestHarness {
   return {
     handler,
     app: mockApp,
-    claudeHandler: mockClaudeHandler,
+    agentHandler: mockAgentHandler,
     reactionManager: mockReactionManager,
     channelConfig,
   };

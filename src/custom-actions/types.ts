@@ -66,7 +66,7 @@ export interface CustomAction<TParams> {
   enabled?: () => boolean;
   /**
    * When true, tools are registered on every turn — not only when
-   * `shouldInjectActions` is true (e.g. read-only tools always available).
+   * action injection is enabled by a future tool-capable session.
    */
   alwaysInject?: boolean;
   /** Zod raw shape for the tool input schema */

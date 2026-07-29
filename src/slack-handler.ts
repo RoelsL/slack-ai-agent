@@ -1,5 +1,5 @@
 import { App } from "@slack/bolt";
-import { ClaudeHandler } from "./claude-handler";
+import { AgentHandler } from "./agent-handler";
 import { FileHandler, ProcessedFile } from "./file-handler";
 import { Logger, withMessageId, truncateForLog } from "./logger";
 import { config } from "./config";
@@ -57,7 +57,7 @@ const isBotAuthoredMessage = (msg: {
 
 export class SlackHandler {
   private app: App;
-  private claudeHandler: ClaudeHandler;
+  private agentHandler: AgentHandler;
   private activeControllers: Map<string, AbortController> = new Map();
   private logger = new Logger("SlackHandler");
   private fileHandler: FileHandler;
@@ -78,17 +78,17 @@ export class SlackHandler {
 
   constructor(
     app: App,
-    claudeHandler: ClaudeHandler,
+    agentHandler: AgentHandler,
     reactionManager: ReactionManager,
     channelConfig: ChannelConfigManager,
   ) {
     this.app = app;
-    this.claudeHandler = claudeHandler;
+    this.agentHandler = agentHandler;
     this.fileHandler = new FileHandler(app);
     this.channelConfig = channelConfig;
     this.reactionManager = reactionManager;
     this.messageProcessor = new MessageProcessor(
-      claudeHandler,
+      agentHandler,
       this.reactionManager,
       this.channelConfig,
     );
@@ -642,7 +642,7 @@ export class SlackHandler {
         timings.skip_and_auth_checks_ms = Date.now() - phaseStart;
         phaseStart = Date.now();
 
-        const sessionKey = this.claudeHandler.getSessionKey(
+        const sessionKey = this.agentHandler.getSessionKey(
           event.user,
           event.channel,
           event.thread_ts || event.ts,
@@ -660,7 +660,7 @@ export class SlackHandler {
         }
 
         // Compute once — used by both the multi-participant gate and
-        // processWithClaude (for SlackContext.isNonEphemeralConditionalChannel)
+        // processWithAgent (for SlackContext.isNonEphemeralConditionalChannel)
         const isNonEphemeralConditional =
           await this.channelConfig.isNonEphemeralConditionalChannel(
             event.channel,
@@ -692,8 +692,8 @@ export class SlackHandler {
         this.setupAbortController(sessionKey);
         const abortController = this.activeControllers.get(sessionKey)!;
 
-        // Process with Claude
-        const result = await this.processWithClaude(
+        // Process with the configured LiteLLM provider
+        const result = await this.processWithAgent(
           event,
           session,
           processedFiles,
@@ -972,13 +972,13 @@ export class SlackHandler {
   private async getOrCreateSession(
     event: MessageEvent,
   ): Promise<ConversationSession> {
-    let session = this.claudeHandler.getSession(
+        let session = this.agentHandler.getSession(
       event.user,
       event.channel,
       event.thread_ts || event.ts,
     );
     if (!session) {
-      session = this.claudeHandler.createSession(
+      session = this.agentHandler.createSession(
         event.user,
         event.channel,
         event.thread_ts || event.ts,
@@ -1002,9 +1002,9 @@ export class SlackHandler {
   }
 
   /**
-   * Process message with Claude
+   * Process one provider-neutral text turn
    */
-  private async processWithClaude(
+  private async processWithAgent(
     event: MessageEvent,
     session: ConversationSession,
     processedFiles: ProcessedFile[],
@@ -1060,9 +1060,9 @@ export class SlackHandler {
       MODE_TRIGGER_EMOJIS,
     );
 
-    // Process with Claude via MessageProcessor
-    const claudeStart = Date.now();
-    const result = await this.messageProcessor.processClaudeStream(
+    // Process with LiteLLM via MessageProcessor
+    const providerStart = Date.now();
+    const result = await this.messageProcessor.processAgentStream(
       userPrompt,
       session,
       abortController,
@@ -1074,7 +1074,7 @@ export class SlackHandler {
       requestMode,
     );
     if (timings) {
-      timings.claude_total_ms = Date.now() - claudeStart;
+      timings.provider_total_ms = Date.now() - providerStart;
       if (result.phaseTimings) {
         Object.assign(timings, result.phaseTimings);
       }
@@ -1167,7 +1167,7 @@ export class SlackHandler {
     }
 
     // 5. Uploaded files (all files including images)
-    // Claude Code will use its Read tool to analyze images directly
+    // Local file tools are deferred; upload metadata is included in the prompt.
     if (processedFiles.length > 0) {
       const filesContent = this.fileHandler.formatFilesOnly(processedFiles);
       sections.push(`## Uploaded Files:\n${filesContent}`);
@@ -1313,7 +1313,7 @@ export class SlackHandler {
   }
 
   /**
-   * Clean up Slack formatting for better readability in Claude context
+   * Clean up Slack formatting for provider context
    */
   private cleanSlackFormatting(text: string): string {
     return (
@@ -1846,7 +1846,7 @@ export class SlackHandler {
 
   /** Compute a message-specific reaction key (does NOT register the message). */
   private getReactionKey(event: MessageEvent): string {
-    const sessionKey = this.claudeHandler.getSessionKey(
+    const sessionKey = this.agentHandler.getSessionKey(
       event.user,
       event.channel,
       event.thread_ts || event.ts,
@@ -2071,7 +2071,7 @@ export class SlackHandler {
     // Cleanup inactive sessions periodically
     setInterval(
       () => {
-        this.claudeHandler.cleanupInactiveSessions();
+        this.agentHandler.cleanupInactiveSessions();
       },
       10 * 60 * 1000,
     );
