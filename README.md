@@ -1,6 +1,6 @@
 # Slack AI Agent
 
-A Slack app powered by a provider-neutral LiteLLM proxy. Responds in DMs, channels, and @-mentions with streaming responses, thread context, file uploads, authorized MCP tools, and deployment-local custom actions. Local filesystem, Bash, web, skills, subagents, and sandboxing remain deferred to Session 3.
+A Slack app powered by a provider-neutral LiteLLM proxy. Responds in DMs, channels, and @-mentions with streaming responses, thread context, read-only scoped file uploads, authorized MCP tools, and deployment-local custom actions.
 
 ## Architecture
 
@@ -60,16 +60,37 @@ Streamable HTTP; protocols are never silently substituted. The installed SDK is
 `@modelcontextprotocol/sdk` 1.29.0.
 
 Tool policy is deny-by-default. Only exact names matching
-`mcp__<server-name>__<tool-name>` can be advertised or dispatched. Role keys
+`mcp__<server-name>__<tool-name>` or `local__read` can be advertised or dispatched. Role keys
 inherit in YAML order, and denylist entries override allowlist entries. Bot,
 workflow, and Slackbot requests have no human role or email and cannot access
 identity-bound servers.
 
 For remote servers, `headersHelper` is a trusted deployment-controlled `/bin/sh`
-command run per connection. It has a 5-second timeout, 32 KiB stdout cap, and
-16 KiB stderr cap. It must emit a JSON object whose values are strings. Helper
+command run per connection. It has a 5-second timeout and a combined 32 KiB
+stdout/stderr buffer. It must emit a JSON object whose values are strings. Helper
 headers override static/bound headers; helper failure aborts the connection and
 never falls back to unauthenticated access. Generated headers are never logged.
+
+Local file access is an application-enforced capability boundary, not OS process
+or container isolation. `local__read` accepts only workspace-relative paths or
+explicit `upload:<id>` grants. It rejects traversal, symlink escape, repository
+paths, secret-like files, arbitrary `/tmp`, other workspaces, binary content,
+oversized files, and oversized line/output ranges. Each dispatch has a 5-second
+wall-clock timeout; caller cancellation propagates as request cancellation. It
+never writes or searches.
+Uploads use per-download temporary directories and are deleted during request
+cleanup on success, failure, abort, and response failure; only logical upload
+identifiers appear in provider prompts/transcripts.
+
+No command execution, web, skills, subagents, planning, write, or search tools
+are exposed. Skills/subagents are deferred/removed. `headersHelper` is trusted,
+deployment-controlled MCP configuration using `/bin/sh`, not a model-exposed
+command tool.
+
+LiteLLM routing and fallback are proxy-owned. The app uses `LITELLM_MODEL`, does
+not forward unsupported provider tuning fields, does not retry another model,
+and aggregates usage/cost across completed provider turns. Values are undefined
+only when trusted proxy metadata is absent.
 
 ### 4. Configure the Bot
 
@@ -84,16 +105,15 @@ Copy the example configs and customize for your workspace:
 | `config/example-tool-denylist.yaml`               | `config/tool-denylist.yaml`               | Tools the bot must never use                                |
 | `config/instructions/example-general-context.txt` | `config/instructions/general-context.txt` | Base system prompt injected into every response             |
 
-#### Deferred / unsupported in Session 1
+#### Optional configuration and capabilities
 
 | Example file                                             | Copy to                               | Purpose                                                                |
 | --------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------ |
 | `config/example-channels.yaml`                           | `config/channels.yaml`                | Channel auto-reply routing, keyword triggers, ephemeral summaries      |
 | `config/instructions/example-channel.txt`                | `config/instructions/<name>.txt`      | Channel-specific system prompt context (referenced by `channels.yaml`) |
-| `config/subagents/example-subagents.yaml`                | Not active                           | Deferred sub-agent configuration                                       |
-| `config/approvable-actions/example-approvable-action.ts` | Not active                           | Deferred custom actions                                                |
+| `config/custom-actions/example-approvable-action.ts`     | Deployment-specific                  | Optional registered custom action                                      |
 | `data/example-employees.yaml`                            | `data/employees.yaml`                 | Employee directory for role assignment and people lookups              |
-| `mcp-servers.example.json`                               | Not active                           | Deferred MCP server configuration                                      |
+| `mcp-servers.example.json`                               | Deployment-specific                  | Optional MCP server configuration                                      |
 
 Quick start:
 
@@ -117,7 +137,7 @@ npm run build && npm run prod  # production
 - **DMs**: responds to all messages
 - **Configured channels**: auto-replies based on `channels.yaml` rules
 - **All other channels**: responds only when @-mentioned
-- **File uploads**: supports images, code files, PDFs, and documents
+- **File uploads**: available to `local__read` only as bounded UTF-8 text; images and PDFs require an MCP capability
 
 ## Testing
 

@@ -103,7 +103,6 @@ export class HttpEventHandler implements EventHandler {
       cache_creation_input_tokens: params.cacheCreationInputTokens,
       cost_usd: params.costUsd,
       turn_count: params.turnCount,
-      is_opus_fast_mode: params.isOpusFastMode,
     };
 
     // Serialize phase timings as an array of "name:duration_ms" strings to

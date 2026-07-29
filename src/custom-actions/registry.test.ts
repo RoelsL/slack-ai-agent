@@ -28,6 +28,7 @@ jest.mock("../tracking", () => ({
 
 import { CustomActionRegistry } from "./registry";
 import { REACTIONS } from "../reaction-manager";
+import { z } from "zod";
 
 describe("CustomActionRegistry reaction lifecycle", () => {
   const ORIGINAL_CHANNEL = "C123";
@@ -243,6 +244,21 @@ describe("CustomActionRegistry reaction lifecycle", () => {
     expect(action.invoke).toHaveBeenCalled();
     expect(result.content[0].text).toBe("doc body");
     expect(app.client.chat.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("creates request-scoped tools, validates arguments, and preserves Slack context", async () => {
+    const invoke = jest.fn().mockImplementation(async (_args: unknown, ctx: any) => `channel=${ctx.channel}`);
+    registry.register(makeAction({
+      inputSchema: { value: z.string() },
+      requiresApproval: false,
+      invoke,
+    }));
+    const ctx = makeCtx({ channel: "C-request-specific" });
+    const [tool] = registry.createFunctionTools(ctx);
+    expect(tool.definition.function.name).toBe("mcp__custom-actions__test-action");
+    await expect(tool.execute({ value: 123 })).resolves.toMatchObject({ isError: true });
+    await expect(tool.execute({ value: "ok" })).resolves.toEqual({ text: "channel=C-request-specific", isError: false });
+    expect(invoke).toHaveBeenCalledWith({ value: "ok" }, ctx);
   });
 
   it("resolves the reaction to error when approving an action missing from the registry", async () => {

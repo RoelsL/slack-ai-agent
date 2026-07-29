@@ -51,7 +51,7 @@ export const REACTIONS = {
   ),
 } as const;
 
-/** Optional custom-emoji message triggers for resolveMode (see request-mode.ts). */
+/** Optional deployment reaction configuration. */
 export const MODE_TRIGGER_EMOJIS: ModeTriggerEmojis = {
   fast: reactionConfig.MODE_TRIGGERS?.FAST
     ? `:${reactionConfig.MODE_TRIGGERS.FAST}:`

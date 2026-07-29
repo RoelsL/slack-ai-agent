@@ -2,7 +2,7 @@
 #
 # Copy this file to channels.yaml and customize for your workspace.
 #
-# - channelSettings: per-channel context file + optional Claude model/effort override
+# - channelSettings: per-channel context file + optional LiteLLM deployment alias
 # - conditionalReplyChannels: control which channels the bot auto-replies in
 # - ephemeralChannelConfig: route private summaries to designated channels/users
 # - dmNotificationConfig: send DM notifications when the bot replies in specific channels
@@ -12,17 +12,12 @@ channelSettings:
     file: example-channel.txt
   - channelNamePattern: "^help-devops$"
     file: example-channel.txt
-  # Optional per-channel model/effort overrides. Users can also override per
-  # message with "think hardest"/"try hardest"/"think harder"/"try harder"/
-  # "think dangerously" (Fable model, max effort), "think hard"/"try hard"
-  # (max effort), or "think fast" (latest Haiku model). See
-  # ModeTriggerEmojis in src/request-mode.ts to also match a custom Slack
-  # emoji shortcode for each trigger.
+  # Optional per-channel LiteLLM deployment alias. Routing and fallback are
+  # owned by the configured proxy; no app-level provider tuning is supported.
   # - channelNamePattern: "^(pd-.*|pagerduty)$"
   #   file: pagerduty-triage.txt
-  #   effort: max
   # - channelNamePattern: "^chat-only$"
-  #   model: claude-haiku-4-5
+  #   model: deployment-alias
 
 # Channel or DM IDs whose full message + tool-call content is logged even
 # when the conversation is private. Without this, private logs are redacted.

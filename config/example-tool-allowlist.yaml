@@ -11,32 +11,8 @@
 
 # Tools available to all members (lowest privilege)
 member:
-  # Claude SDK native tools
-  - BashOutput
-  - ExitPlanMode
-  - Glob
-  - Grep
-  - ListMcpResources
-  - Read
-  - ReadMcpResource
-  - Skill
-  - Task
-  - TodoWrite
-  - WebFetch
-  - WebSearch
-  - Write
-
-  # Bash commands (read-only)
-  - "Bash(date:*)"
-  - "Bash(echo:*)"
-  - "Bash(cat:*)"
-  - "Bash(ls:*)"
-  - "Bash(grep:*)"
-  - "Bash(head:*)"
-  - "Bash(tail:*)"
-  - "Bash(jq:*)"
-  - "Bash(find:*)"
-  - "Bash(rg:*)"
+  # The only local capability is bounded read-only UTF-8 access.
+  - local__read
 
   # Example MCP server tools (uncomment and adjust for your setup)
   # - mcp__slack__slack_get_channel_messages
@@ -60,10 +36,6 @@ engineer:
   # - mcp__sentry__get_issue_details
   # - mcp__sentry__search_issues
 
-  # Example: Full AWS CLI access
-  # - "Bash(aws:*)"
 
 # Tools restricted to privileged engineers only
 privilegedEngineer:
-  # Example: BigQuery CLI access
-  # - "Bash(bq:*)"

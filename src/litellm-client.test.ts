@@ -13,7 +13,7 @@ function responseFor(body: string): Response {
 describe("LiteLLMClient", () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it("normalizes the version path once and sends only text request fields", async () => {
+  it("normalizes the version path once and omits tools when absent", async () => {
     expect(normalizeLiteLLMBaseUrl("https://proxy.example/v1///")).toBe(
       "https://proxy.example/v1",
     );
@@ -50,6 +50,14 @@ describe("LiteLLMClient", () => {
       }),
     );
     expect(chunks).toEqual([{ text: "hi" }, { done: true }]);
+  });
+
+  it("serializes authorized OpenAI-compatible tools", async () => {
+    const fetchMock = jest.spyOn(global, "fetch").mockResolvedValue(responseFor("data: [DONE]\n\n"));
+    const client = new LiteLLMClient({ baseUrl: "http://proxy", apiKey: "x", model: "m", requestTimeoutMs: 1000 });
+    const tools = [{ type: "function" as const, function: { name: "local__read", parameters: { type: "object" } } }];
+    for await (const _chunk of client.streamChat({ model: "m", messages: [], tools })) { /* consume */ }
+    expect(JSON.parse(fetchMock.mock.calls[0][1]!.body as string).tools).toEqual(tools);
   });
 
   it("handles split payloads, multiple events, comments, and terminal usage", async () => {

@@ -5,10 +5,14 @@ import { Logger } from "./logger";
 import { config } from "./config";
 export interface ProcessedFile {
   path: string;
+  logicalId: string;
   name: string;
   mimetype: string;
   size: number;
+  uploadDir: string;
 }
+
+export const SLACK_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 
 export class FileHandler {
   private logger = new Logger("FileHandler");
@@ -47,8 +51,9 @@ export class FileHandler {
   }
 
   private async downloadFile(file: any): Promise<ProcessedFile | null> {
-    // Check file size limit (50MB)
-    if (file.size > 50 * 1024 * 1024) {
+    // Check declared file size before downloading; the actual byte count is
+    // checked again after download because metadata is untrusted.
+    if (typeof file.size !== "number" || file.size < 0 || file.size > SLACK_UPLOAD_MAX_BYTES) {
       this.logger.warn("File too large, skipping", {
         name: file.name,
         size: file.size,
@@ -56,6 +61,8 @@ export class FileHandler {
       return null;
     }
 
+    let uploadDir: string | undefined;
+    let tempPath: string | undefined;
     try {
       let buffer: Buffer;
 
@@ -119,23 +126,29 @@ export class FileHandler {
         });
         throw new Error("Slack Web API client required for file downloads");
       }
-      const tempDir = os.tmpdir();
-      const tempPath = path.join(
-        tempDir,
-        `slack-file-${Date.now()}-${file.name}`,
-      );
-
-      fs.writeFileSync(tempPath, buffer);
+      if (buffer.length > SLACK_UPLOAD_MAX_BYTES) {
+        this.logger.warn("Downloaded file exceeds upload limit", { name: file.name });
+        return null;
+      }
+      uploadDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "slack-ai-upload-"));
+      const safeName = path.basename(String(file.name || "upload")).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100) || "upload";
+      tempPath = path.join(uploadDir, safeName);
+      fs.writeFileSync(tempPath, buffer, { flag: "wx" });
+      const logicalId = `upload:${String(file.id || Date.now()).replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 
       const processed: ProcessedFile = {
         path: tempPath,
+        logicalId,
         name: file.name,
         mimetype: file.mimetype,
-        size: file.size,
+        size: buffer.length,
+        uploadDir,
       };
 
       return processed;
     } catch (error) {
+      if (tempPath) fs.rmSync(tempPath, { force: true });
+      if (uploadDir) fs.rmSync(uploadDir, { recursive: true, force: true });
       this.logger.error("Failed to download file", {
         error: error instanceof Error ? error.message : String(error),
         fileName: file.name,
@@ -149,7 +162,6 @@ export class FileHandler {
 
   /**
    * Format uploaded files into a prompt string for the configured provider.
-   * Local file tools are intentionally deferred to a later migration session.
    * @param files - Array of processed files to format
    * @returns Formatted string with file information
    */
@@ -160,11 +172,11 @@ export class FileHandler {
 
     const parts: string[] = files.map(
       file =>
-        `- **${file.name}** (${file.mimetype}, ${file.size} bytes): \`${file.path}\``,
+        `- **${file.name}** (${file.mimetype}, ${file.size} bytes): \`${file.logicalId}\``,
     );
 
     return (
-      "The following files have been uploaded and are available at the listed paths:\n" +
+      "The following files have been uploaded and are available through the read-only local__read tool using the listed identifiers:\n" +
       parts.join("\n")
     );
   }
@@ -175,10 +187,10 @@ export class FileHandler {
         fs.unlinkSync(file.path);
       } catch (error) {
         this.logger.warn("Failed to cleanup temp file", {
-          path: file.path,
           error,
         });
       }
+      fs.rmSync(file.uploadDir, { recursive: true, force: true });
     }
   }
 }

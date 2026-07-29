@@ -171,7 +171,10 @@ export class McpManager {
   } | null = null;
   private readonly CACHE_TTL_MS = CONTEXT_CACHE_TTL_MS;
 
-  constructor(configPath: string = "./mcp-servers.json") {
+  constructor(
+    configPath: string = "./mcp-servers.json",
+    private readonly policyPaths: { allowlist?: string; denylist?: string } = {},
+  ) {
     this.configPath = path.resolve(configPath);
   }
 
@@ -297,7 +300,7 @@ export class McpManager {
     }
 
     const allowlistContent = fs.readFileSync(
-      path.resolve("config/tool-allowlist.yaml"),
+      path.resolve(this.policyPaths.allowlist ?? "config/tool-allowlist.yaml"),
       "utf-8",
     );
     const allowlist = yaml.load(allowlistContent) as ToolAllowlist;
@@ -356,7 +359,7 @@ export class McpManager {
 
   /** The single authorization gate used for advertisement and dispatch. */
   async authorizeTool(name: string, context: ToolPolicyContext): Promise<ToolPolicyDecision> {
-    if (!/^mcp__[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(name)) {
+    if (!isSupportedToolName(name)) {
       return { allowed: false, reason: "not-allowlisted" };
     }
     if (!context.hasHumanIdentity) return { allowed: false, reason: "anonymous" };
@@ -380,7 +383,7 @@ export class McpManager {
 
   private matchesTool(pattern: unknown, name: string): boolean {
     // Legacy native names and Bash(...) entries intentionally never match.
-    return typeof pattern === "string" && /^mcp__[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(pattern) && pattern === name;
+    return typeof pattern === "string" && isSupportedToolName(pattern) && pattern === name;
   }
 
   // Retry loading denylist every 30s on error so fixes are picked up quickly
@@ -403,7 +406,7 @@ export class McpManager {
       }
     }
 
-    const denylistPath = path.resolve("config/tool-denylist.yaml");
+    const denylistPath = path.resolve(this.policyPaths.denylist ?? "config/tool-denylist.yaml");
     if (!fs.existsSync(denylistPath)) {
       this.logger.warn("No tool denylist file found — denying all tools");
       this.denylistCache = { data: [], fetchedAt: now, isError: true };
@@ -442,4 +445,9 @@ export class McpManager {
   getDisallowedTools(): string[] {
     return this.loadToolDenylist();
   }
+}
+
+/** The sole policy grammar: configured MCP/custom tools or the one local tool. */
+export function isSupportedToolName(name: string): boolean {
+  return name === "local__read" || /^mcp__[A-Za-z0-9._-]+__[A-Za-z0-9._-]+$/.test(name);
 }

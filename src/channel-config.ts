@@ -2,7 +2,7 @@ import { App } from "@slack/bolt";
 import { Logger } from "./logger";
 import { SlackChannelType } from "./types";
 import { CONTEXT_CACHE_TTL_MS } from "./constants";
-import { AllowedModel, ChannelModeConfig, EffortLevel } from "./request-mode";
+import { AllowedModel, ChannelModeConfig } from "./request-mode";
 import * as fs from "fs";
 import * as path from "path";
 import * as yaml from "js-yaml";
@@ -13,13 +13,6 @@ interface ChannelSettings {
   file?: string;
   /** Per-channel provider deployment override. */
   model?: AllowedModel;
-  /** Per-channel effort override. Dropped for models that don't accept effort (e.g. Haiku). */
-  effort?: EffortLevel;
-  // fastModePattern and fastModeTagBot are OR — either independently enables fast mode.
-  /** Regex tested against the message text; fast mode activates only on match. Use ".*" for always-on. */
-  fastModePattern?: string;
-  /** Fast mode activates when the user @-mentions the bot. */
-  fastModeTagBot?: boolean;
 }
 
 interface ConditionalReplyChannel {
@@ -31,7 +24,7 @@ interface ConditionalReplyChannel {
 }
 
 interface ChannelConfig {
-  /** Per-channel context + model/effort settings. First matching pattern wins. */
+  /** Per-channel context + deployment model alias. First matching pattern wins. */
   channelSettings: ChannelSettings[];
   conditionalReplyChannels?: ConditionalReplyChannel[];
   ephemeralChannelConfig: Record<string, string[]>;
@@ -373,13 +366,10 @@ export class ChannelConfigManager {
     channelType: SlackChannelType,
   ): Promise<ChannelModeConfig | undefined> {
     const s = await this.findChannelSettings(channelId, channelType);
-    if (!s?.model && !s?.effort && !s?.fastModePattern && !s?.fastModeTagBot)
+    if (!s?.model)
       return undefined;
     return {
       model: s.model,
-      effort: s.effort,
-      fastModePattern: s.fastModePattern,
-      fastModeTagBot: s.fastModeTagBot,
     };
   }
 

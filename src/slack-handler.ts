@@ -600,6 +600,10 @@ export class SlackHandler {
   async handleMessage(event: MessageEvent, say: any): Promise<void> {
     const startTime = Date.now();
     const messageId = generateMessageId(event.channel, event.ts);
+    let processedFiles: ProcessedFile[] = [];
+    let sessionKey: string | undefined;
+    let reactionKey: string | undefined;
+    let requestController: AbortController | undefined;
 
     // Wrap entire handling with messageId context for automatic log correlation
     return withMessageId(messageId, async () => {
@@ -642,12 +646,12 @@ export class SlackHandler {
         timings.skip_and_auth_checks_ms = Date.now() - phaseStart;
         phaseStart = Date.now();
 
-        const sessionKey = this.agentHandler.getSessionKey(
+        sessionKey = this.agentHandler.getSessionKey(
           event.user,
           event.channel,
           event.thread_ts || event.ts,
         );
-        const reactionKey = `${sessionKey}:${event.ts}`;
+        reactionKey = `${sessionKey}:${event.ts}`;
         this.reactionManager.registerMessage(
           reactionKey,
           event.channel,
@@ -677,7 +681,7 @@ export class SlackHandler {
         phaseStart = Date.now();
 
         // Process files
-        const processedFiles = await this.processFiles(event, reactionKey);
+        processedFiles = await this.processFiles(event, reactionKey);
         timings.file_processing_ms = Date.now() - phaseStart;
 
         // Exit if no content to process
@@ -691,6 +695,7 @@ export class SlackHandler {
         // Set up abort controller
         this.setupAbortController(sessionKey);
         const abortController = this.activeControllers.get(sessionKey)!;
+        requestController = abortController;
 
         // Process with the configured LiteLLM provider
         const result = await this.processWithAgent(
@@ -713,9 +718,6 @@ export class SlackHandler {
           reactionKey,
           timings,
         );
-
-        // Cleanup
-        await this.cleanup(processedFiles, sessionKey, reactionKey);
 
         // Log final response with timing, token usage, and tracking link
         const duration = Date.now() - startTime;
@@ -761,6 +763,10 @@ export class SlackHandler {
         return;
       } catch (error: any) {
         return await this.handleError(error, event, say);
+      } finally {
+        // Uploads are request-scoped capabilities. Cleanup runs on success,
+        // provider failure, abort, and response failure alike.
+        await this.cleanup(processedFiles, sessionKey ?? "", reactionKey, requestController);
       }
     });
   }
@@ -1046,6 +1052,12 @@ export class SlackHandler {
         ? reactionKey
         : undefined,
       workingDirectory: session.workingDirectory,
+      uploads: processedFiles.map(file => ({
+        logicalId: file.logicalId,
+        displayName: file.name,
+        realPath: file.path,
+        size: file.size,
+      })),
     };
 
     // Message triggers in event.text override the channel-level default.
@@ -1626,7 +1638,6 @@ export class SlackHandler {
           costUsd: result.costUsd,
           turnCount: result.turnCount,
           phaseTimings,
-          isOpusFastMode: result.requestMode?.fast ?? false,
         });
       } catch (trackingError) {
         this.logger.warn(
@@ -1679,6 +1690,7 @@ export class SlackHandler {
     processedFiles: ProcessedFile[],
     sessionKey: string,
     reactionKey?: string,
+    requestController?: AbortController,
   ): Promise<void> {
     // Clean up temporary files
     if (processedFiles.length > 0) {
@@ -1686,13 +1698,16 @@ export class SlackHandler {
     }
 
     // Clean up controller
-    this.activeControllers.delete(sessionKey);
+    if (sessionKey && this.activeControllers.get(sessionKey) === requestController) {
+      this.activeControllers.delete(sessionKey);
+    }
 
     // Schedule cleanup of reaction tracking. Kept long enough to outlive a
     // pending custom-action dialog: approve/cancel can land hours later and
     // update the original message's reaction through this same session, so it
     // must still be registered when they do.
     const keyToClean = reactionKey || sessionKey;
+    if (!keyToClean) return;
     setTimeout(
       () => {
         this.reactionManager.cleanupSession(keyToClean);

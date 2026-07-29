@@ -24,7 +24,6 @@ export interface MessageProcessedEvent {
   costUsd?: number;
   turnCount?: number;
   phaseTimings?: PhaseTimings;
-  isOpusFastMode?: boolean;
 }
 
 export interface FeedbackEvent {

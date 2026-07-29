@@ -4,7 +4,7 @@ export interface ConversationSession {
   threadTs?: string;
   /** Normalized in-memory transcript sent to the provider. */
   history: import("./agent-types").AgentMessage[];
-  /** Legacy/deferred workspace path; Session 1 does not enforce a sandbox. */
+  /** Read-only session workspace capability root. */
   workingDirectory: string;
   lastActivity: Date;
 }
@@ -61,8 +61,10 @@ export interface SlackContext {
    *  reactions are enabled (non-ephemeral contexts), so custom actions can
    *  update the reaction through the session path while the turn is live. */
   reactionKey?: string;
-  /** Legacy/deferred workspace path; Session 1 does not enforce a sandbox. */
+  /** Read-only session workspace capability root, when local__read is enabled. */
   workingDirectory?: string;
+  /** Request-scoped upload grants; host paths are never provider-visible. */
+  uploads?: import("./agent-types").UploadGrant[];
 }
 
 export interface TokenUsage {

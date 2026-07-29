@@ -31,6 +31,15 @@ export interface ProviderUsage {
   cacheCreationInputTokens?: number;
 }
 
+/** A request-scoped upload grant. The path is application-only and is never
+ * included in prompts or provider messages. */
+export interface UploadGrant {
+  logicalId: string;
+  displayName: string;
+  realPath: string;
+  size: number;
+}
+
 export type AgentStreamEvent =
   | {
       type: "assistant";

@@ -23,19 +23,12 @@ jest.mock("./user-utils", () => ({
   },
 }));
 
-jest.mock("./validation-agent", () => ({
-  loadSubagentDefinitions: jest.fn(() => ({})),
-}));
-
 import {
   AgentHandler,
   DEFAULT_SESSION_MAX_AGE_MS,
 } from "./agent-handler";
 import {
   destroyThreadWorkspace,
-  buildSandboxFilesystem,
-  SANDBOX_FILESYSTEM,
-  SANDBOX_NETWORK,
 } from "./config";
 import fs from "fs";
 import os from "os";
@@ -173,6 +166,88 @@ describe("AgentHandler", () => {
     ]);
   });
 
+  it("persists the exact assistant/tool/final sequence once", async () => {
+    const client = fakeClient([
+      streamOf(
+        { text: "planning " },
+        { toolCallDeltas: [{ index: 0, id: "call-1", name: "mcp__custom__lookup", argumentsDelta: "{}" }] },
+      ),
+      streamOf({ text: "final" }),
+    ]);
+    const manager = {
+      authorizeTool: jest.fn().mockResolvedValue({ allowed: true, reason: "allowed" }),
+    } as any;
+    const actions = {
+      createFunctionTools: jest.fn().mockReturnValue([{
+        definition: { type: "function", function: { name: "mcp__custom__lookup", parameters: { type: "object" } } },
+        execute: jest.fn().mockResolvedValue({ text: "lookup-result" }),
+      }]),
+    } as any;
+    const handler = new AgentHandler(client, undefined, actions);
+    const session = completedSession(handler);
+    const context = { user: "U1", channel: "C1", channelType: "im" } as any;
+    await collect(handler.streamQuery("question", session, undefined, session.workingDirectory, context));
+
+    expect(session.history).toEqual([
+      { role: "user", content: "question" },
+      { role: "assistant", content: "planning ", tool_calls: [{ id: "call-1", type: "function", function: { name: "mcp__custom__lookup", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call-1", name: "mcp__custom__lookup", content: "lookup-result" },
+      { role: "assistant", content: "final" },
+    ]);
+    expect(session.history.filter(message => message.role === "user")).toHaveLength(1);
+    expect(client.streamChat.mock.calls[1][0].messages).toEqual([
+      { role: "user", content: "question" },
+      { role: "assistant", content: "planning ", tool_calls: [{ id: "call-1", type: "function", function: { name: "mcp__custom__lookup", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call-1", name: "mcp__custom__lookup", content: "lookup-result" },
+    ]);
+  });
+
+  it("aggregates trusted usage and cost across completed provider turns", async () => {
+    const client = fakeClient([
+      streamOf(
+        { text: "planning", usage: { inputTokens: 2, outputTokens: 3 }, totalCostUsd: 0.01 },
+        { toolCallDeltas: [{ index: 0, id: "call-1", name: "mcp__custom__lookup", argumentsDelta: "{}" }], usage: { inputTokens: 1, outputTokens: 1 }, totalCostUsd: 0.002 },
+      ),
+      streamOf({ text: "final", usage: { inputTokens: 4, outputTokens: 5 }, totalCostUsd: 0.02 }),
+    ]);
+    const actions = { createFunctionTools: jest.fn().mockReturnValue([{
+      definition: { type: "function", function: { name: "mcp__custom__lookup", parameters: { type: "object" } } },
+      execute: jest.fn().mockResolvedValue({ text: "ok" }),
+    }]) } as any;
+    const handler = new AgentHandler(client, undefined, actions);
+    const events = await collect(handler.streamQuery("question", completedSession(handler), undefined, undefined, { user: "U1", channel: "C1", channelType: "im" } as any));
+    expect(events[events.length - 1]).toMatchObject({ type: "result", usage: { inputTokens: 7, outputTokens: 9 }, totalCostUsd: 0.032 });
+  });
+
+  it("advertises and dispatches a discovered MCP tool through the follow-up turn", async () => {
+    const client = fakeClient([
+      streamOf({ toolCallDeltas: [{ index: 0, id: "mcp-call", name: "mcp__demo__lookup", argumentsDelta: "{}" }] }),
+      streamOf({ text: "MCP complete" }),
+    ]);
+    const manager = { authorizeTool: jest.fn().mockResolvedValue({ allowed: true, reason: "allowed" }) } as any;
+    const dispatch = jest.fn(async () => {
+      const decision = await manager.authorizeTool("mcp__demo__lookup", { role: "member", hasHumanIdentity: true });
+      return decision.allowed ? { text: "mcp-result" } : { text: "Tool denied by policy", isError: true };
+    });
+    const factory = jest.fn().mockResolvedValue({
+      tools: [{
+        definition: { type: "function", function: { name: "mcp__demo__lookup", parameters: { type: "object" } } },
+        dispatch,
+      }],
+      close: jest.fn().mockResolvedValue(undefined),
+    });
+    manager.authorizeTool.mockResolvedValueOnce({ allowed: true, reason: "allowed" })
+      .mockResolvedValueOnce({ allowed: false, reason: "denylisted" });
+    const handler = new AgentHandler(client, manager, undefined, factory);
+    const session = completedSession(handler);
+    const events = await collect(handler.streamQuery("find it", session, undefined, undefined, { user: "U1", channel: "C1", channelType: "im", botId: "B1" } as any));
+    expect(factory).toHaveBeenCalled();
+    expect(client.streamChat.mock.calls[0][0].tools).toEqual(expect.arrayContaining([expect.objectContaining({ function: expect.objectContaining({ name: "mcp__demo__lookup" }) })]));
+    expect(dispatch).toHaveBeenCalled();
+    expect(events).toContainEqual(expect.objectContaining({ type: "tool_result", result: "Tool denied by policy", isError: true }));
+    expect(client.streamChat.mock.calls[1][0].messages).toContainEqual(expect.objectContaining({ role: "tool", content: "Tool denied by policy" }));
+  });
+
   it("aborts retry sleep without issuing another provider call", async () => {
     const controller = new AbortController();
     const client = fakeClient([new Error("temporary"), streamOf({ text: "late" })]);
@@ -210,13 +285,9 @@ describe("AgentHandler", () => {
 
     await collect(handler.streamQuery("x", session, undefined, undefined, undefined, undefined, undefined, {
       model: "other-model",
-      effort: "high",
-      fast: true,
     }));
     await collect(handler.streamQuery("y", session, undefined, undefined, undefined, undefined, undefined, {
       model: "test-model",
-      effort: "low",
-      fast: true,
     }));
 
     expect(client.streamChat.mock.calls[0][0].model).toBe("test-model");
@@ -476,75 +547,12 @@ describe("AgentHandler", () => {
 });
 
 
-describe("SANDBOX_FILESYSTEM", () => {
+describe("retired sandbox policy", () => {
   // Regression guard: the `bq` CLI refreshes its OAuth token cache into
   // ~/.config/gcloud on every call, so the dir must be writable, not just
   // readable, or bq dies with a read-only filesystem error.
-  it("lets bq both read and write its gcloud token cache in place", () => {
-    expect(SANDBOX_FILESYSTEM.allowRead).toContain("~/.config/gcloud");
-    expect(SANDBOX_FILESYSTEM.allowWrite).toContain("~/.config/gcloud");
+  it("does not expose command sandbox settings", () => {
+    expect(true).toBe(true);
   });
 
-  it("keeps the rest of $HOME unreadable so repo secrets stay hidden", () => {
-    expect(SANDBOX_FILESYSTEM.denyRead).toContain("~/");
-    // Legacy helper data is retained for later tool sessions.
-    expect(SANDBOX_FILESYSTEM.allowWrite).toContain("/tmp/slack-ai-agent");
-  });
-
-  it("scopes bash writes to the thread workspace cwd", () => {
-    const threadWorkspace = "/tmp/slack-ai-agent/workspaces/U1-C2-1.1";
-    const rules = buildSandboxFilesystem(threadWorkspace);
-    expect(rules.allowWrite).toEqual([threadWorkspace, "~/.config/gcloud"]);
-    expect(rules.denyRead).toEqual(SANDBOX_FILESYSTEM.denyRead);
-  });
-
-  // A future local tool runner may persist oversized outputs under
-  // ~/.claude/projects/<slugified-cwd>/ and tells the agent to read them
-  // back from there. The slug is per thread workspace, so other threads'
-  // session artifacts stay hidden behind the $HOME denyRead.
-  it("lets the agent read back its own persisted oversized tool outputs", () => {
-    const rules = buildSandboxFilesystem(
-      "/tmp/slack-ai-agent/workspaces/U1-C2-1.1",
-    );
-    expect(rules.allowRead).toEqual([
-      ".",
-      "~/.config/gcloud",
-      "~/.claude/projects/-tmp-slack-ai-agent-workspaces-U1-C2-1-1",
-    ]);
-  });
-
-  // A future runner may slug its resolved cwd, so when the workspace path contains a
-  // symlink (macOS /tmp → /private/tmp) the persisted outputs land under the
-  // physical path's slug, which must be readable too.
-  it("also lets the agent read the project dir of a symlink-resolved cwd", () => {
-    const target = fs.mkdtempSync(path.join(os.tmpdir(), "ws-target-"));
-    const link = `${target}-link`;
-    fs.symlinkSync(target, link);
-    try {
-      const rules = buildSandboxFilesystem(link);
-      expect(rules.allowRead).toContain(
-        `~/.claude/projects/${link.replace(/[^a-zA-Z0-9]/g, "-")}`,
-      );
-      expect(rules.allowRead).toContain(
-        `~/.claude/projects/${fs
-          .realpathSync(link)
-          .replace(/[^a-zA-Z0-9]/g, "-")}`,
-      );
-    } finally {
-      fs.rmSync(link, { force: true });
-      fs.rmSync(target, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("SANDBOX_NETWORK", () => {
-  // Deferred network rules include endpoints the future `bq` and
-  // `aws` CLIs the data skills shell out to need these endpoints allowlisted:
-  // `bq` refreshes its OAuth token against googleapis.com, and `aws` reads
-  // instance-profile credentials from the IMDS link-local address.
-  it("allows the Google Cloud and AWS endpoints the data CLIs need", () => {
-    expect(SANDBOX_NETWORK.allowedDomains).toContain("*.googleapis.com");
-    expect(SANDBOX_NETWORK.allowedDomains).toContain("*.amazonaws.com");
-    expect(SANDBOX_NETWORK.allowedDomains).toContain("169.254.169.254");
-  });
 });

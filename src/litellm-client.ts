@@ -137,6 +137,7 @@ export class LiteLLMClient {
         body: JSON.stringify({
           model: request.model,
           messages: request.messages,
+          ...(request.tools && request.tools.length > 0 && { tools: request.tools }),
           stream: true,
           stream_options: { include_usage: true },
         }),

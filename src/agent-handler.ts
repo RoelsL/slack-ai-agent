@@ -10,13 +10,15 @@ import { Logger } from "./logger";
 import { ConversationSession, SlackContext } from "./types";
 import { RequestMode } from "./request-mode";
 import { McpManager } from "./mcp-manager";
-import { McpRequestToolSet, DiscoveredTool, TOOL_RESULT_MAX_SIZE } from "./mcp-client";
+import { McpRequestToolSet, DiscoveredTool, RequestToolSet, TOOL_RESULT_MAX_SIZE } from "./mcp-client";
 import { CustomActionRegistry } from "./custom-actions/registry";
 import { UserUtils } from "./user-utils";
+import { LocalReadTool } from "./local-file-tool";
 
 export const DEFAULT_SESSION_MAX_AGE_MS = 16 * 60 * 60 * 1000;
 const MAX_TURNS = 10;
 export const MAX_AGENTIC_TURNS = 8;
+export type RequestToolSetFactory = (manager: McpManager, context: SlackContext) => Promise<RequestToolSet>;
 
 interface RetryOptions {
   maxRetries: number;
@@ -38,6 +40,7 @@ export class AgentHandler {
     client?: AgentProviderClient,
     private readonly mcpManager?: McpManager,
     private readonly customActions?: CustomActionRegistry,
+    private readonly requestToolSetFactory: RequestToolSetFactory = (manager, context) => McpRequestToolSet.create(manager, context),
   ) {
     this.client = client ?? new LiteLLMClient(config.litellm);
   }
@@ -121,11 +124,9 @@ export class AgentHandler {
     const messages = this.buildHistory(priorHistory, systemPrompt, prompt);
     const requestedModel = requestMode?.model;
     const model = requestedModel === config.litellm.model ? requestedModel : config.litellm.model;
-    if (requestMode && (requestMode.effort || requestMode.fast || (requestedModel && requestedModel !== model))) {
+    if (requestMode && requestedModel && requestedModel !== model) {
       this.logger.info("Ignoring unsupported provider request mode fields", {
         modelIgnored: !!requestedModel && requestedModel !== model,
-        effortIgnored: !!requestMode.effort,
-        fastIgnored: !!requestMode.fast,
       });
     }
 
@@ -136,7 +137,16 @@ export class AgentHandler {
     let toolSet: { tools: DiscoveredTool[]; close(): Promise<void> } = { tools: [], close: async () => undefined };
     try {
       if (this.mcpManager && _slackContext) {
-        toolSet = await McpRequestToolSet.create(this.mcpManager, _slackContext);
+        toolSet = await this.requestToolSetFactory(this.mcpManager, _slackContext);
+      }
+      if (_slackContext && this.mcpManager) {
+        const local = await LocalReadTool.create(
+          this.mcpManager,
+          _slackContext,
+          _workingDirectory ?? targetSession?.workingDirectory ?? "",
+          _slackContext.uploads ?? [],
+        );
+        if (local) toolSet.tools.push(local);
       }
       if (this.customActions && _slackContext) {
         const actionTools = this.customActions.createFunctionTools({
@@ -181,16 +191,19 @@ export class AgentHandler {
         await this.simpleRetry(async () => {
           turnText = "";
           deltas.clear();
-          usage = undefined;
-          totalCostUsd = undefined;
+          let attemptUsage: ProviderUsage | undefined;
+          let attemptCostUsd: number | undefined;
+          let attemptText = "";
           for await (const chunk of this.client.streamChat({
-            model, messages: workingMessages,
+            model, messages: [...workingMessages],
             tools: toolSet.tools.length ? toolSet.tools.map(tool => tool.definition) : undefined,
             signal: abortController?.signal,
           })) {
-            if (chunk.text) { turnText += chunk.text; output += chunk.text; }
-            if (chunk.usage) usage = chunk.usage;
-            if (chunk.totalCostUsd !== undefined) totalCostUsd = chunk.totalCostUsd;
+            if (chunk.text) { turnText += chunk.text; attemptText += chunk.text; }
+            if (chunk.usage) attemptUsage = addUsage(attemptUsage, chunk.usage);
+            if (chunk.totalCostUsd !== undefined && Number.isFinite(chunk.totalCostUsd)) {
+              attemptCostUsd = (attemptCostUsd ?? 0) + chunk.totalCostUsd;
+            }
             for (const delta of chunk.toolCallDeltas ?? []) {
               const current = deltas.get(delta.index) ?? { id: `call_${delta.index}`, name: "", args: "" };
               if (delta.id) current.id = delta.id;
@@ -199,13 +212,23 @@ export class AgentHandler {
               deltas.set(delta.index, current);
             }
           }
+          // Only merge telemetry and visible text after the complete stream
+          // attempt succeeds. Failed/retried attempts are discarded.
+          output += attemptText;
+          if (attemptUsage) usage = addUsage(usage, attemptUsage);
+          if (attemptCostUsd !== undefined) totalCostUsd = (totalCostUsd ?? 0) + attemptCostUsd;
         }, onRetry, abortController?.signal);
         const calls = [...deltas.values()].map(call => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.args } }));
         if (turnText || calls.length) {
           yield { type: "assistant", message: { content: turnText ? [{ type: "text", text: turnText }] : [], ...(calls.length && { toolCalls: calls }) } };
         }
-        if (!calls.length) break;
-        workingMessages = [...workingMessages, { role: "assistant", content: turnText || null, tool_calls: calls }];
+        if (!calls.length) {
+          // Persist this exact final provider turn. `output` is UI-only
+          // aggregate text and must never be used to reconstruct history.
+          if (turnText) workingMessages.push({ role: "assistant", content: turnText });
+          break;
+        }
+        workingMessages.push({ role: "assistant", content: turnText || null, tool_calls: calls });
         for (const call of calls) {
           if (abortController?.signal.aborted) throw abortError();
           const tool = toolSet.tools.find(candidate => candidate.definition.function.name === call.function.name);
@@ -226,7 +249,7 @@ export class AgentHandler {
 
     if (abortController?.signal.aborted) throw abortError();
     if (targetSession) {
-      targetSession.history = this.commitHistory(workingMessages, output);
+      targetSession.history = this.commitHistory(workingMessages);
       targetSession.lastActivity = new Date();
     }
     yield {
@@ -247,8 +270,8 @@ export class AgentHandler {
     return [...(system ? [system] : []), ...recent, { role: "user", content: prompt }];
   }
 
-  private commitHistory(messages: AgentMessage[], output: string): AgentMessage[] {
-    const committed = [...messages, { role: "assistant" as const, content: output }];
+  private commitHistory(messages: AgentMessage[]): AgentMessage[] {
+    const committed = [...messages];
     const system = committed.find(message => message.role === "system");
     const turns = this.trimTranscript(committed
       .filter(message => message.role !== "system")
@@ -280,4 +303,17 @@ function abortError(): Error {
   const error = new Error("Request aborted");
   error.name = "AbortError";
   return error;
+}
+
+function addUsage(current: ProviderUsage | undefined, next: ProviderUsage): ProviderUsage {
+  return {
+    inputTokens: (current?.inputTokens ?? 0) + next.inputTokens,
+    outputTokens: (current?.outputTokens ?? 0) + next.outputTokens,
+    ...(current?.cacheReadInputTokens !== undefined || next.cacheReadInputTokens !== undefined
+      ? { cacheReadInputTokens: (current?.cacheReadInputTokens ?? 0) + (next.cacheReadInputTokens ?? 0) }
+      : {}),
+    ...(current?.cacheCreationInputTokens !== undefined || next.cacheCreationInputTokens !== undefined
+      ? { cacheCreationInputTokens: (current?.cacheCreationInputTokens ?? 0) + (next.cacheCreationInputTokens ?? 0) }
+      : {}),
+  };
 }

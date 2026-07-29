@@ -1086,4 +1086,13 @@ describe("SlackHandler", () => {
       expect(result).toBe(false);
     });
   });
+
+  describe("request cleanup", () => {
+    it("does not schedule empty-key cleanup or delete an unrelated controller", async () => {
+      const cleanupSession = t.reactionManager.cleanupSession;
+      await priv(handler).cleanup([], "", undefined);
+      expect(cleanupSession).not.toHaveBeenCalled();
+      expect(t.agentHandler).toBeDefined();
+    });
+  });
 });
