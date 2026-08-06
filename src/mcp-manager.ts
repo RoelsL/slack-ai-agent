@@ -35,6 +35,7 @@ export interface ToolPolicyContext {
 
 export type McpStdioServerConfig = {
   type?: "stdio"; // Optional for backwards compatibility
+  enabled?: boolean;
   command: string;
   args?: string[];
   env?: Record<string, string>;
@@ -42,6 +43,8 @@ export type McpStdioServerConfig = {
 
 export type McpSSEServerConfig = {
   type: "sse";
+  /** Explicit deployment gate. Disabled servers are not connected. */
+  enabled?: boolean;
   url: string;
   headers?: Record<string, string>;
   /**
@@ -51,16 +54,34 @@ export type McpSSEServerConfig = {
    * regenerating mcp-servers.json.
    */
   headersHelper?: string;
+  /** Restrict discovery to exact remote tool names before policy evaluation. */
+  allowedTools?: string[];
+  /** Require credentials to come from the deployment helper, never static config. */
+  requireHeadersHelper?: boolean;
+  /** Header names permitted after helper resolution. */
+  allowedHeaders?: string[];
+  /** Header names that must be present after helper resolution. */
+  requiredHeaders?: string[];
   /** See {@link bindUserToMcpServers}. Not passed through to the SDK. */
   userEmailHeader?: string;
 };
 
 export type McpHttpServerConfig = {
   type: "http";
+  /** Explicit deployment gate. Disabled servers are not connected. */
+  enabled?: boolean;
   url: string;
   headers?: Record<string, string>;
   /** See {@link McpSSEServerConfig.headersHelper}. */
   headersHelper?: string;
+  /** Restrict discovery to exact remote tool names before policy evaluation. */
+  allowedTools?: string[];
+  /** Require credentials to come from the deployment helper, never static config. */
+  requireHeadersHelper?: boolean;
+  /** Header names permitted after helper resolution. */
+  allowedHeaders?: string[];
+  /** Header names that must be present after helper resolution. */
+  requiredHeaders?: string[];
   /** See {@link bindUserToMcpServers}. Not passed through to the SDK. */
   userEmailHeader?: string;
 };
@@ -73,6 +94,14 @@ export type McpServerConfig =
 export interface McpConfiguration {
   mcpServers: Record<string, McpServerConfig>;
 }
+
+export const GITORA_ALLOWED_TOOLS = [
+  "list_projects",
+  "search_projects",
+  "get_project",
+  "list_project_packages",
+  "get_project_package",
+] as const;
 
 /**
  * Bind the requesting user's identity to identity-aware MCP servers.
@@ -158,6 +187,31 @@ export async function resolveMcpHeaders(
   }
 }
 
+/**
+ * Validate deployment-supplied headers after a credential helper runs.
+ * This deliberately does not return or log header values.
+ */
+export function validateMcpHeaders(
+  headers: Record<string, string>,
+  options: Pick<McpHttpServerConfig | McpSSEServerConfig, "allowedHeaders" | "requiredHeaders" | "requireHeadersHelper">,
+): void {
+  const allowed = options.allowedHeaders?.map(header => header.toLowerCase());
+  if (allowed && Object.keys(headers).some(header => !allowed.includes(header.toLowerCase()))) {
+    throw new Error("MCP headers contain an unapproved header");
+  }
+  const required = options.requiredHeaders?.map(header => header.toLowerCase()) ?? [];
+  for (const header of required) {
+    const actual = Object.keys(headers).find(candidate => candidate.toLowerCase() === header);
+    if (!actual || !headers[actual]) throw new Error("MCP headers are incomplete");
+  }
+  if (options.requireHeadersHelper) {
+    const authorization = Object.entries(headers).find(([key]) => key.toLowerCase() === "authorization")?.[1];
+    if (!authorization || !/^Bearer [A-Za-z0-9._~-]+$/.test(authorization)) {
+      throw new Error("MCP authorization header is invalid");
+    }
+  }
+}
+
 export class McpManager {
   private logger = new Logger("McpManager");
   private config: McpConfiguration | null = null;
@@ -205,10 +259,27 @@ export class McpManager {
         return null;
       }
 
+      // Deployment files may refer to non-secret environment configuration.
+      // Header values are intentionally not interpolated here; credentials must
+      // come from the helper and are validated after helper execution.
+      for (const serverConfig of Object.values(parsedConfig.mcpServers) as McpServerConfig[]) {
+        if (serverConfig.type === "http" || serverConfig.type === "sse") {
+          serverConfig.url = expandEnvironmentReference(serverConfig.url);
+          if (serverConfig.headersHelper) serverConfig.headersHelper = expandEnvironmentReference(serverConfig.headersHelper);
+        }
+      }
+
       // Validate server configurations
       for (const [serverName, serverConfig] of Object.entries(
         parsedConfig.mcpServers,
       )) {
+        if ((serverConfig as McpServerConfig & { enabled?: boolean })?.enabled === false) {
+          this.logger.info("MCP server disabled by deployment configuration", {
+            serverName,
+          });
+          delete parsedConfig.mcpServers[serverName];
+          continue;
+        }
         if (
           !this.validateServerConfig(
             serverName,
@@ -262,6 +333,38 @@ export class McpManager {
           type: config.type,
         });
         return false;
+      }
+
+      if (urlConfig.requireHeadersHelper) {
+        if (!urlConfig.headersHelper?.trim()) {
+          this.logger.warn("Credential helper is required for MCP server", {
+            serverName,
+          });
+          return false;
+        }
+        // A bearer credential must never be supplied from the shared config
+        // file. The deployment helper is the only supported credential source.
+        if (Object.keys(urlConfig.headers ?? {}).some(key => key.toLowerCase() === "authorization")) {
+          this.logger.warn("Static authorization header is not allowed for MCP server", {
+            serverName,
+          });
+          return false;
+        }
+      }
+
+      if (urlConfig.allowedTools !== undefined && (
+        urlConfig.allowedTools.length === 0 ||
+        urlConfig.allowedTools.some(tool => !isSupportedToolName(`mcp__${serverName}__${tool}`))
+      )) {
+        this.logger.warn("Invalid MCP tool restriction configuration", { serverName });
+        return false;
+      }
+
+      for (const tools of [urlConfig.allowedTools, urlConfig.allowedHeaders, urlConfig.requiredHeaders]) {
+        if (tools !== undefined && (!Array.isArray(tools) || tools.some(value => typeof value !== "string" || value.length === 0))) {
+          this.logger.warn("Invalid MCP server restriction configuration", { serverName });
+          return false;
+        }
       }
     } else {
       this.logger.warn("Unknown server type", {
@@ -445,6 +548,10 @@ export class McpManager {
   getDisallowedTools(): string[] {
     return this.loadToolDenylist();
   }
+}
+
+function expandEnvironmentReference(value: string): string {
+  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, key: string) => process.env[key] ?? "");
 }
 
 /** The sole policy grammar: configured MCP/custom tools or the one local tool. */

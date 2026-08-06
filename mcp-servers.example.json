@@ -28,6 +28,16 @@
         "X-Api-Version": "2024-01-01"
       },
       "headersHelper": "/opt/company/bin/mcp-headers"
+    },
+    "gitora": {
+      "enabled": false,
+      "type": "http",
+      "url": "${GITORA_MCP_URL}",
+      "headersHelper": "${GITORA_MCP_HEADERS_HELPER}",
+      "requireHeadersHelper": true,
+      "allowedHeaders": ["Authorization"],
+      "requiredHeaders": ["Authorization"],
+      "allowedTools": ["list_projects", "search_projects", "get_project", "list_project_packages", "get_project_package"]
     }
   }
 }

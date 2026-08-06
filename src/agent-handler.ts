@@ -18,6 +18,9 @@ import { LocalReadTool } from "./local-file-tool";
 export const DEFAULT_SESSION_MAX_AGE_MS = 16 * 60 * 60 * 1000;
 const MAX_TURNS = 10;
 export const MAX_AGENTIC_TURNS = 8;
+const PACKAGE_PAGE_SIZE = 5;
+const LARGE_PACKAGE_INVENTORY_RESPONSE =
+  "This project has {count} installed packages, so I cannot return every package in one Slack response. I can help with a specific package, version, dependency type, security issue, or provide a bounded summary. Please narrow the request.";
 export type RequestToolSetFactory = (manager: McpManager, context: SlackContext) => Promise<RequestToolSet>;
 
 interface RetryOptions {
@@ -131,6 +134,7 @@ export class AgentHandler {
     }
 
     let output = "";
+    let boundedPackageInventory: number | undefined;
     let usage: ProviderUsage | undefined;
     let totalCostUsd: number | undefined;
     let workingMessages = [...messages];
@@ -184,6 +188,7 @@ export class AgentHandler {
         } })));
       }
 
+      const broadPackageRequest = isBroadPackageInventoryRequest(prompt);
       for (let turn = 0; turn < MAX_AGENTIC_TURNS; turn++) {
         if (abortController?.signal.aborted) throw abortError();
         let turnText = "";
@@ -241,13 +246,33 @@ export class AgentHandler {
           const boundedResult = result.text.length > TOOL_RESULT_MAX_SIZE ? `${result.text.slice(0, TOOL_RESULT_MAX_SIZE)}… [truncated]` : result.text;
           yield { type: "tool_result", toolCallId: call.id, toolName: call.function.name, result: boundedResult, isError: result.isError };
           workingMessages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: boundedResult });
+          const packageCount = largePackageInventoryCount(
+            call.function.name,
+            result,
+            turn,
+            broadPackageRequest,
+          );
+          if (packageCount !== undefined) {
+            boundedPackageInventory = packageCount;
+            break;
+          }
         }
+        if (boundedPackageInventory !== undefined) break;
       }
     } finally {
       await toolSet.close();
     }
 
     if (abortController?.signal.aborted) throw abortError();
+    if (boundedPackageInventory !== undefined) {
+      const response = LARGE_PACKAGE_INVENTORY_RESPONSE.replace(
+        "{count}",
+        String(boundedPackageInventory),
+      );
+      output = response;
+      workingMessages.push({ role: "assistant", content: response });
+      yield { type: "assistant", message: { content: [{ type: "text", text: response }] } };
+    }
     if (targetSession) {
       targetSession.history = this.commitHistory(workingMessages);
       targetSession.lastActivity = new Date();
@@ -297,6 +322,36 @@ export class AgentHandler {
       }
     }
   }
+}
+
+function isBroadPackageInventoryRequest(prompt: string): boolean {
+  return /\b(all|every|complete|entire|full|list)\b[\s\S]{0,80}\b(packages?|dependencies|inventory)\b/i.test(prompt) ||
+    /\b(packages?|dependencies|inventory)\b[\s\S]{0,80}\b(all|every|complete|entire|full)\b/i.test(prompt);
+}
+
+function largePackageInventoryCount(
+  toolName: string,
+  result: { text: string; isError?: boolean },
+  turn: number,
+  broadRequest: boolean,
+): number | undefined {
+  if (!broadRequest || result.isError || !toolName.endsWith("list_project_packages")) return undefined;
+
+  let payload: unknown;
+  try { payload = JSON.parse(result.text); } catch { return undefined; }
+  if (!payload || typeof payload !== "object") return undefined;
+  const data = payload as {
+    totalCount?: unknown;
+    moreResultsAvailable?: unknown;
+    packages?: unknown;
+  };
+  if (typeof data.totalCount !== "number" || !Number.isFinite(data.totalCount) || data.totalCount < 0) return undefined;
+  if (data.moreResultsAvailable !== true) return undefined;
+
+  const returnedCount = Array.isArray(data.packages) ? data.packages.length : PACKAGE_PAGE_SIZE;
+  const remainingFetches = Math.max(0, MAX_AGENTIC_TURNS - turn - 1);
+  const maxFetchable = returnedCount + remainingFetches * PACKAGE_PAGE_SIZE;
+  return data.totalCount > maxFetchable ? Math.floor(data.totalCount) : undefined;
 }
 
 function abortError(): Error {

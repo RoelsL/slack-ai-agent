@@ -20,6 +20,7 @@ jest.mock("./config", () => ({
 jest.mock("./user-utils", () => ({
   UserUtils: {
     getUserRole: jest.fn().mockResolvedValue("member"),
+    getUserEmail: jest.fn().mockResolvedValue("user@example.com"),
   },
 }));
 
@@ -246,6 +247,125 @@ describe("AgentHandler", () => {
     expect(dispatch).toHaveBeenCalled();
     expect(events).toContainEqual(expect.objectContaining({ type: "tool_result", result: "Tool denied by policy", isError: true }));
     expect(client.streamChat.mock.calls[1][0].messages).toContainEqual(expect.objectContaining({ role: "tool", content: "Tool denied by policy" }));
+  });
+
+  it("bounds a broad large package inventory without dispatching cursor pages", async () => {
+    const client = fakeClient([
+      streamOf({ toolCallDeltas: [{ index: 0, id: "packages-call", name: "mcp__gitora__list_project_packages", argumentsDelta: "{}" }] }),
+      streamOf({ text: "should not be requested" }),
+    ]);
+    const dispatch = jest.fn().mockResolvedValue({
+      text: JSON.stringify({
+        packages: [{ package: { machineName: "vendor/example" } }],
+        totalCount: 437,
+        nextCursor: "cursor-1",
+        moreResultsAvailable: true,
+      }),
+    });
+    const manager = {
+      authorizeTool: jest.fn().mockResolvedValue({ allowed: false, reason: "not-allowlisted" }),
+    } as any;
+    const factory = jest.fn().mockResolvedValue({
+      tools: [{
+        definition: {
+          type: "function",
+          function: { name: "mcp__gitora__list_project_packages", parameters: { type: "object" } },
+        },
+        dispatch,
+      }],
+      close: jest.fn().mockResolvedValue(undefined),
+    });
+    const handler = new AgentHandler(client, manager, undefined, factory);
+
+    const events = await collect(handler.streamQuery(
+      "List all packages for this project",
+      completedSession(handler),
+      undefined,
+      undefined,
+      { user: "U1", channel: "C1", channelType: "im" } as any,
+    ));
+    const final = events[events.length - 1];
+    const assistantText = events
+      .filter((event): event is Extract<typeof event, { type: "assistant" }> => event.type === "assistant")
+      .flatMap(event => event.message.content.map(part => part.text))
+      .join("");
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(client.streamChat).toHaveBeenCalledTimes(1);
+    expect(assistantText).toContain("This project has 437 installed packages");
+    expect(assistantText).toContain("specific package, version, dependency type, security issue");
+    expect(final).toMatchObject({ type: "result", result: expect.stringContaining("437 installed packages") });
+  });
+
+  it("does not block a focused package request from a large inventory", async () => {
+    const client = fakeClient([
+      streamOf({ toolCallDeltas: [{ index: 0, id: "packages-call", name: "mcp__gitora__list_project_packages", argumentsDelta: "{}" }] }),
+      streamOf({ text: "Package version is 1.2.3" }),
+    ]);
+    const dispatch = jest.fn().mockResolvedValue({
+      text: JSON.stringify({ totalCount: 437, nextCursor: "cursor-1", moreResultsAvailable: true }),
+    });
+    const factory = jest.fn().mockResolvedValue({
+      tools: [{
+        definition: {
+          type: "function",
+          function: { name: "mcp__gitora__list_project_packages", parameters: { type: "object" } },
+        },
+        dispatch,
+      }],
+      close: jest.fn().mockResolvedValue(undefined),
+    });
+    const handler = new AgentHandler(client, {
+      authorizeTool: jest.fn().mockResolvedValue({ allowed: false, reason: "not-allowlisted" }),
+    } as any, undefined, factory);
+
+    const events = await collect(handler.streamQuery(
+      "What version is vendor/example?",
+      completedSession(handler),
+      undefined,
+      undefined,
+      { user: "U1", channel: "C1", channelType: "im" } as any,
+    ));
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(client.streamChat).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual(expect.objectContaining({ type: "assistant", message: { content: [{ type: "text", text: "Package version is 1.2.3" }] } }));
+  });
+
+  it("resolves a project and uses direct package lookup for a focused version question", async () => {
+    const client = fakeClient([
+      streamOf({ toolCallDeltas: [{ index: 0, id: "search-call", name: "mcp__gitora__search_projects", argumentsDelta: JSON.stringify({ query: "Cyclobility" }) }] }),
+      streamOf({ toolCallDeltas: [{ index: 0, id: "package-call", name: "mcp__gitora__get_project_package", argumentsDelta: JSON.stringify({ projectId: 42, machineName: "drupal/core" }) }] }),
+      streamOf({ text: "Cyclobility uses drupal/core 10.3.1." }),
+    ]);
+    const searchDispatch = jest.fn().mockResolvedValue({
+      text: JSON.stringify({ projects: [{ id: 42, name: "Cyclobility" }] }),
+    });
+    const packageDispatch = jest.fn().mockResolvedValue({
+      text: JSON.stringify({ package: { package: { machineName: "drupal/core" }, release: { version: "10.3.1" } } }),
+    });
+    const factory = jest.fn().mockResolvedValue({
+      tools: [
+        { definition: { type: "function", function: { name: "mcp__gitora__search_projects", parameters: { type: "object" } } }, dispatch: searchDispatch },
+        { definition: { type: "function", function: { name: "mcp__gitora__get_project_package", parameters: { type: "object" } } }, dispatch: packageDispatch },
+      ],
+      close: jest.fn().mockResolvedValue(undefined),
+    });
+    const manager = { authorizeTool: jest.fn().mockResolvedValue({ allowed: true, reason: "allowed" }) } as any;
+    const handler = new AgentHandler(client, manager, undefined, factory);
+
+    const events = await collect(handler.streamQuery(
+      "What version of drupal/core does the Cyclobility project use?",
+      completedSession(handler),
+      undefined,
+      undefined,
+      { user: "U1", channel: "C1", channelType: "im" } as any,
+    ));
+
+    expect(searchDispatch).toHaveBeenCalledTimes(1);
+    expect(packageDispatch).toHaveBeenCalledTimes(1);
+    expect(client.streamChat).toHaveBeenCalledTimes(3);
+    expect(events).toContainEqual(expect.objectContaining({ type: "assistant", message: { content: [{ type: "text", text: "Cyclobility uses drupal/core 10.3.1." }] } }));
   });
 
   it("aborts retry sleep without issuing another provider call", async () => {

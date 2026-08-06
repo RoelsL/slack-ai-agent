@@ -43,8 +43,9 @@ Fill in your tokens. See `.env.example` for all available variables.
 
 Inference requires `LITELLM_BASE_URL`, `LITELLM_API_KEY`, `LITELLM_MODEL`, and
 `LITELLM_REQUEST_TIMEOUT_MS`. The proxy must expose the OpenAI-compatible
-`/v1/chat/completions` streaming endpoint. The base URL may include or omit
-`/v1`; it is normalized once by the client.
+`/v1/responses` streaming endpoint. Responses is required because reasoning
+models cannot use function tools through the Chat Completions endpoint. The
+base URL may include or omit `/v1`; it is normalized once by the client.
 
 Conversation history is in-memory for the process lifetime and isolated per
 Slack user/channel/thread session. Requests include one current system prompt,

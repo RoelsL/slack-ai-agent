@@ -6,6 +6,12 @@
 # git clone / git checkout are blocked to prevent the agent from cloning repos.
 
 disallowed_tools:
+  # Gitora mutations are denied even if a future server advertises them.
+  - mcp__gitora__create_project
+  - mcp__gitora__update_project
+  - mcp__gitora__delete_project
+  - mcp__gitora__sync_repository
+  - mcp__gitora__send_notification
   # GitHub write operations
   - mcp__github__create_or_update_file
   - mcp__github__create_pull_request

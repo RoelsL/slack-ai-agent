@@ -36,14 +36,20 @@ export function normalizeLiteLLMBaseUrl(baseUrl: string): string {
 function usageFromWire(value: unknown): ProviderUsage | undefined {
   if (!value || typeof value !== "object") return undefined;
   const usage = value as Record<string, unknown>;
-  const input = usage.prompt_tokens;
-  const output = usage.completion_tokens;
+  const input = usage.input_tokens ?? usage.prompt_tokens;
+  const output = usage.output_tokens ?? usage.completion_tokens;
   if (typeof input !== "number" || typeof output !== "number") return undefined;
+  const inputDetails = usage.input_token_details;
+  const cachedInput = inputDetails && typeof inputDetails === "object"
+    ? (inputDetails as Record<string, unknown>).cached_tokens
+    : undefined;
   return {
     inputTokens: input,
     outputTokens: output,
-    ...(typeof usage.cache_read_input_tokens === "number" && {
-      cacheReadInputTokens: usage.cache_read_input_tokens,
+    ...((typeof cachedInput === "number" || typeof usage.cache_read_input_tokens === "number") && {
+      cacheReadInputTokens: typeof cachedInput === "number"
+        ? cachedInput
+        : usage.cache_read_input_tokens as number,
     }),
     ...(typeof usage.cache_creation_input_tokens === "number" && {
       cacheCreationInputTokens: usage.cache_creation_input_tokens,
@@ -51,49 +57,188 @@ function usageFromWire(value: unknown): ProviderUsage | undefined {
   };
 }
 
-function getDeltaText(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const choices = (value as Record<string, unknown>).choices;
-  if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== "object") {
-    return undefined;
-  }
-  const delta = (choices[0] as Record<string, unknown>).delta;
-  if (!delta || typeof delta !== "object") return undefined;
-  const content = (delta as Record<string, unknown>).content;
-  return typeof content === "string" ? content : undefined;
-}
-
-function getToolCallDeltas(value: unknown): ProviderStreamChunk["toolCallDeltas"] {
-  if (!value || typeof value !== "object") return undefined;
-  const choices = (value as Record<string, unknown>).choices;
-  if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== "object") return undefined;
-  const delta = (choices[0] as Record<string, unknown>).delta;
-  if (!delta || typeof delta !== "object") return undefined;
-  const calls = (delta as Record<string, unknown>).tool_calls;
-  if (!Array.isArray(calls)) return undefined;
-  const result = calls.flatMap((call): NonNullable<ProviderStreamChunk["toolCallDeltas"]> => {
-    if (!call || typeof call !== "object") return [];
-    const record = call as Record<string, unknown>;
-    if (typeof record.index !== "number") return [];
-    const fn = record.function;
-    const functionRecord = fn && typeof fn === "object" ? fn as Record<string, unknown> : undefined;
-    return [{
-      index: record.index,
-      ...(typeof record.id === "string" && { id: record.id }),
-      ...(typeof functionRecord?.name === "string" && { name: functionRecord.name }),
-      ...(typeof functionRecord?.arguments === "string" && { argumentsDelta: functionRecord.arguments }),
-    }];
-  });
-  return result.length ? result : undefined;
-}
-
 function costFromWire(value: unknown): number | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
-  const candidate = record.response_cost ?? record.total_cost;
-  return typeof candidate === "number" && Number.isFinite(candidate)
-    ? candidate
-    : undefined;
+  for (const candidate of [record.response_cost, record.total_cost, record.cost]) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  }
+  for (const nested of [record.response, record.metadata]) {
+    const cost = costFromWire(nested);
+    if (cost !== undefined) return cost;
+  }
+  return undefined;
+}
+
+interface ResponsesInputMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface ResponsesFunctionCallInput {
+  type: "function_call";
+  call_id: string;
+  name: string;
+  arguments: string;
+}
+
+interface ResponsesFunctionCallOutputInput {
+  type: "function_call_output";
+  call_id: string;
+  output: string;
+}
+
+type ResponsesInputItem =
+  | ResponsesInputMessage
+  | ResponsesFunctionCallInput
+  | ResponsesFunctionCallOutputInput;
+
+function translateMessages(messages: ProviderChatRequest["messages"]): {
+  input: ResponsesInputItem[];
+  instructions?: string;
+} {
+  const instructions = messages
+    .filter(message => message.role === "system" && typeof message.content === "string")
+    .map(message => message.content as string)
+    .filter(Boolean)
+    .join("\n\n");
+  const input: ResponsesInputItem[] = [];
+
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "user" || message.role === "assistant") {
+      if (typeof message.content === "string") {
+        input.push({ role: message.role, content: message.content });
+      }
+      for (const call of message.tool_calls ?? []) {
+        input.push({
+          type: "function_call",
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments,
+        });
+      }
+      continue;
+    }
+    if (message.role === "tool" && typeof message.tool_call_id === "string") {
+      input.push({
+        type: "function_call_output",
+        call_id: message.tool_call_id,
+        output: typeof message.content === "string" ? message.content : "",
+      });
+    }
+  }
+
+  return {
+    input,
+    ...(instructions && { instructions }),
+  };
+}
+
+function translateTools(tools: NonNullable<ProviderChatRequest["tools"]>): Array<Record<string, unknown>> {
+  return tools.map(tool => ({
+    type: "function",
+    name: tool.function.name,
+    ...(tool.function.description !== undefined && { description: tool.function.description }),
+    parameters: tool.function.parameters,
+  }));
+}
+
+interface FunctionCallState {
+  index: number;
+  itemId?: string;
+  id?: string;
+  name?: string;
+  arguments: string;
+}
+
+interface ResponsesStreamState {
+  calls: Map<number, FunctionCallState>;
+  indexes: Map<string, number>;
+  nextIndex: number;
+}
+
+function newResponsesStreamState(): ResponsesStreamState {
+  return { calls: new Map(), indexes: new Map(), nextIndex: 0 };
+}
+
+function recordFrom(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function functionCallDelta(
+  value: Record<string, unknown>,
+  state: ResponsesStreamState,
+  item?: Record<string, unknown>,
+  argumentsDelta?: string,
+): ProviderStreamChunk["toolCallDeltas"] {
+  const source = item ?? value;
+  if (source.type !== "function_call") return undefined;
+  const itemId = typeof source.id === "string"
+    ? source.id
+    : typeof value.item_id === "string" ? value.item_id : undefined;
+  const callId = typeof source.call_id === "string"
+    ? source.call_id
+    : typeof value.call_id === "string" ? value.call_id : undefined;
+  const key = itemId ? `item:${itemId}` : callId ? `call:${callId}` : undefined;
+  let index = key ? state.indexes.get(key) : undefined;
+  if (index === undefined && typeof value.output_index === "number") index = value.output_index;
+  if (index === undefined) index = state.nextIndex++;
+  state.nextIndex = Math.max(state.nextIndex, index + 1);
+  const current = state.calls.get(index) ?? { index, arguments: "" };
+  if (itemId) {
+    current.itemId = itemId;
+    state.indexes.set(`item:${itemId}`, index);
+  }
+  if (callId) {
+    current.id = callId;
+    state.indexes.set(`call:${callId}`, index);
+  }
+  if (typeof source.name === "string") current.name = source.name;
+  if (typeof source.arguments === "string" && argumentsDelta === undefined) {
+    current.arguments = source.arguments;
+  }
+  if (argumentsDelta !== undefined) current.arguments += argumentsDelta;
+  state.calls.set(index, current);
+  const delta = {
+    index,
+    ...(current.id && { id: current.id }),
+    ...(current.name && { name: current.name }),
+    ...(argumentsDelta !== undefined && argumentsDelta.length > 0 && { argumentsDelta }),
+  };
+  return [delta];
+}
+
+function finalFunctionCallDelta(
+  value: Record<string, unknown>,
+  state: ResponsesStreamState,
+  item?: Record<string, unknown>,
+): ProviderStreamChunk["toolCallDeltas"] {
+  const source = item ?? value;
+  const finalArguments = typeof source.arguments === "string" ? source.arguments : undefined;
+  const itemId = typeof source.id === "string"
+    ? source.id
+    : typeof value.item_id === "string" ? value.item_id : undefined;
+  const callId = typeof source.call_id === "string"
+    ? source.call_id
+    : typeof value.call_id === "string" ? value.call_id : undefined;
+  const key = itemId ? `item:${itemId}` : callId ? `call:${callId}` : undefined;
+  const index = key ? state.indexes.get(key) : undefined;
+  const existingArguments = index === undefined ? "" : state.calls.get(index)?.arguments ?? "";
+  const before = functionCallDelta(value, state, item);
+  if (!before?.length) return before;
+  const current = state.calls.get(before[0].index)!;
+  let missing = "";
+  if (finalArguments !== undefined && finalArguments !== existingArguments) {
+    missing = finalArguments.startsWith(existingArguments)
+      ? finalArguments.slice(existingArguments.length)
+      : finalArguments;
+    current.arguments = finalArguments;
+  }
+  return [{
+    ...before[0],
+    ...(missing && { argumentsDelta: missing }),
+  }];
 }
 
 /**
@@ -110,7 +255,7 @@ export class LiteLLMClient {
     if (!Number.isFinite(config.requestTimeoutMs) || config.requestTimeoutMs <= 0) {
       throw new Error("Invalid LiteLLM request timeout");
     }
-    this.endpoint = `${normalizeLiteLLMBaseUrl(config.baseUrl)}/chat/completions`;
+    this.endpoint = `${normalizeLiteLLMBaseUrl(config.baseUrl)}/responses`;
   }
 
   async *streamChat(
@@ -136,10 +281,9 @@ export class LiteLLMClient {
         },
         body: JSON.stringify({
           model: request.model,
-          messages: request.messages,
-          ...(request.tools && request.tools.length > 0 && { tools: request.tools }),
+          ...translateMessages(request.messages),
+          ...(request.tools && request.tools.length > 0 && { tools: translateTools(request.tools) }),
           stream: true,
-          stream_options: { include_usage: true },
         }),
         signal,
       });
@@ -160,26 +304,29 @@ export class LiteLLMClient {
       const decoder = new TextDecoder();
       let buffer = "";
       let finished = false;
+      const streamState = newResponsesStreamState();
       for (;;) {
         const { done, value } = await reader.read();
         buffer += decoder.decode(value, { stream: !done });
         const events = splitSseEvents(buffer);
         buffer = events.remainder;
         for (const event of events.events) {
-          const parsed = parseSseEvent(event);
-          if (parsed.done) {
-            finished = true;
-            yield { done: true };
-            break;
+           const parsed = parseSseEvent(event, streamState);
+           if (parsed.done) {
+             finished = true;
+             if (parsed.value) yield parsed.value;
+             else yield { done: true };
+             break;
           }
           if (parsed.value) yield parsed.value;
         }
         if (finished || done) {
           if (!finished && buffer.trim()) {
-            const parsed = parseSseEvent(buffer + "\n\n");
+            const parsed = parseSseEvent(buffer + "\n\n", streamState);
             if (parsed.done) {
               finished = true;
-              yield { done: true };
+              if (parsed.value) yield parsed.value;
+              else yield { done: true };
             }
             else if (parsed.value) yield parsed.value;
           }
@@ -239,7 +386,10 @@ function splitSseEvents(input: string): { events: string[]; remainder: string } 
   return { events, remainder: input.slice(start) };
 }
 
-function parseSseEvent(event: string): { done: boolean; value?: ProviderStreamChunk } {
+function parseSseEvent(
+  event: string,
+  state: ResponsesStreamState,
+): { done: boolean; value?: ProviderStreamChunk } {
   const dataLines = event
     .split(/\r?\n/)
     .filter(line => line.startsWith("data:"))
@@ -255,10 +405,46 @@ function parseSseEvent(event: string): { done: boolean; value?: ProviderStreamCh
     throw new LiteLLMProviderError("LiteLLM returned malformed stream data");
   }
   const record = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
-  const text = getDeltaText(json);
-  const toolCallDeltas = getToolCallDeltas(json);
+  const eventType = typeof record.type === "string" ? record.type : "";
+  if (eventType === "error" || eventType === "response.failed" || eventType === "response.incomplete" || eventType.endsWith(".error")) {
+    throw new LiteLLMProviderError("LiteLLM response failed");
+  }
+  if (eventType === "response.completed") {
+    const response = record.response;
+    const responseRecord = recordFrom(response);
+    const usage = usageFromWire(responseRecord?.usage);
+    const totalCostUsd = costFromWire(responseRecord) ?? costFromWire(record);
+    return {
+      done: true,
+      value: {
+        done: true,
+        ...(usage && { usage }),
+        ...(totalCostUsd !== undefined && { totalCostUsd }),
+      },
+    };
+  }
+
+  let text: string | undefined;
+  if (eventType === "response.output_text.delta" && typeof record.delta === "string") {
+    text = record.delta;
+  }
+
+  let toolCallDeltas: ProviderStreamChunk["toolCallDeltas"];
+  if (eventType === "response.function_call_arguments.delta" && typeof record.delta === "string") {
+    toolCallDeltas = functionCallDelta({ ...record, type: "function_call", call_id: record.call_id }, state, undefined, record.delta);
+  } else if (eventType === "response.function_call_arguments.done") {
+    toolCallDeltas = finalFunctionCallDelta({ ...record, type: "function_call", call_id: record.call_id }, state);
+  } else if (eventType === "response.output_item.added" || eventType === "response.output_item.done") {
+    const item = recordFrom(record.item);
+    if (item?.type === "function_call") {
+      toolCallDeltas = eventType.endsWith("done")
+        ? finalFunctionCallDelta(record, state, item)
+        : functionCallDelta(record, state, item);
+    }
+  }
+
   const usage = usageFromWire(record.usage);
-  const totalCostUsd = costFromWire(json);
+  const totalCostUsd = costFromWire(record);
   if (!text && !toolCallDeltas?.length && !usage && totalCostUsd === undefined) return { done: false };
   return {
     done: false,

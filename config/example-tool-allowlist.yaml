@@ -13,6 +13,12 @@
 member:
   # The only local capability is bounded read-only UTF-8 access.
   - local__read
+  # Gitora is read-only and remains explicitly gated by mcp-servers.json.
+  # - mcp__gitora__list_projects
+  # - mcp__gitora__search_projects
+  # - mcp__gitora__get_project
+  # - mcp__gitora__list_project_packages
+  # - mcp__gitora__get_project_package
 
   # Example MCP server tools (uncomment and adjust for your setup)
   # - mcp__slack__slack_get_channel_messages
