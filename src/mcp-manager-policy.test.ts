@@ -12,7 +12,7 @@ describe("McpManager centralized policy gate", () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-policy-"));
     allowlist = path.join(dir, "allow.yaml");
     denylist = path.join(dir, "deny.yaml");
-    fs.writeFileSync(denylist, "disallowed_tools:\n  - mcp__github__blocked\n");
+    fs.writeFileSync(denylist, "disallowed_tools:\n  - mcp__github__blocked\n  - mcp__redmine__manage_issue_note\n");
   });
 
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -21,6 +21,7 @@ describe("McpManager centralized policy gate", () => {
     fs.writeFileSync(allowlist, [
       "member:",
       "  - mcp__github__read",
+      "  - mcp__redmine__manage_issue_note",
       "engineer:",
       "  - mcp__github__blocked",
       "  - mcp__github__deploy",
@@ -31,6 +32,8 @@ describe("McpManager centralized policy gate", () => {
     await expect(manager.authorizeTool("mcp__github__read", { role: "engineer", hasHumanIdentity: true }))
       .resolves.toMatchObject({ allowed: true });
     await expect(manager.authorizeTool("mcp__github__blocked", { role: "engineer", hasHumanIdentity: true }))
+      .resolves.toMatchObject({ allowed: false, reason: "denylisted" });
+    await expect(manager.authorizeTool("mcp__redmine__manage_issue_note", { role: "member", hasHumanIdentity: true }))
       .resolves.toMatchObject({ allowed: false, reason: "denylisted" });
     await expect(manager.authorizeTool("mcp__github__deploy", { role: "member", hasHumanIdentity: true }))
       .resolves.toMatchObject({ allowed: false, reason: "not-allowlisted" });

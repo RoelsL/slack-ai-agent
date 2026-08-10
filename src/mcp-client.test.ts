@@ -29,7 +29,8 @@ describe("Gitora MCP interoperability through the installed SDK", () => {
 
     server = http.createServer((request, response) => {
       const authorization = request.headers.authorization;
-      if (authorization !== "Bearer test-token" || authMode === "invalid" || authMode === "expired") {
+      const isRedmine = request.url?.includes("server=redmine") ?? false;
+      if (!isRedmine && (authorization !== "Bearer test-token" || authMode === "invalid" || authMode === "expired")) {
         response.writeHead(401, { "WWW-Authenticate": 'Bearer realm="gitora-mcp"' });
         response.end();
         return;
@@ -71,7 +72,11 @@ describe("Gitora MCP interoperability through the installed SDK", () => {
             jsonrpc: "2.0",
             id,
             result: {
-              tools: [
+              tools: isRedmine ? [
+                { name: "list_redmine_projects", description: "List Redmine projects", inputSchema: { type: "object", additionalProperties: false } },
+                { name: "search_redmine_issues", description: "Search Redmine issues", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" } }, additionalProperties: false } },
+                { name: "manage_issue_note", description: "Must never be exposed", inputSchema: { type: "object" } },
+              ] : [
                 { name: "list_projects", description: "List projects", inputSchema: { type: "object", additionalProperties: false } },
                 { name: "search_projects", description: "Search projects", inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" } }, additionalProperties: false } },
                  { name: "get_project", description: "Get a project", inputSchema: { type: "object", required: ["projectId"], properties: { projectId: { type: "integer" } }, additionalProperties: false } },
@@ -87,6 +92,10 @@ describe("Gitora MCP interoperability through the installed SDK", () => {
           const params = body.params as { name?: string; arguments?: Record<string, unknown> };
           const name = params.name;
           const args = params.arguments ?? {};
+          if (isRedmine && name === "search_redmine_issues") {
+            response.end(JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ issues: [{ id: 42, subject: "Read-only fixture issue" }] }) }] } }));
+            return;
+          }
            if (name === "get_project" && args.projectId === 999) {
             response.end(JSON.stringify({ jsonrpc: "2.0", id, result: { isError: true, content: [{ type: "text", text: "Project not found" }] } }));
             return;
@@ -219,6 +228,44 @@ describe("Gitora MCP interoperability through the installed SDK", () => {
   it("does not dispatch a newly advertised Gitora tool after discovery", async () => {
     const toolSet = await McpRequestToolSet.create(writeConfiguration(), context);
     expect(toolSet.tools.some(tool => tool.definition.function.name.endsWith("create_project"))).toBe(false);
+    await toolSet.close();
+  });
+
+  it("connects to a non-Gitora Streamable HTTP server and exposes only explicit Redmine reads", async () => {
+    const redmineAllowlist = path.join(directory, "redmine-allow.yaml");
+    const redmineDenylist = path.join(directory, "redmine-deny.yaml");
+    const configPath = path.join(directory, "redmine-mcp-servers.json");
+    fs.writeFileSync(redmineAllowlist, [
+      "member:",
+      "  - mcp__redmine__list_redmine_projects",
+      "  - mcp__redmine__search_redmine_issues",
+    ].join("\n") + "\n");
+    fs.writeFileSync(redmineDenylist, "disallowed_tools:\n  - mcp__redmine__manage_issue_note\n");
+    fs.writeFileSync(configPath, JSON.stringify({ mcpServers: {
+      redmine: {
+        type: "http",
+        url: `${endpoint}?server=redmine`,
+        allowedTools: ["list_redmine_projects", "search_redmine_issues"],
+      },
+    }}));
+
+    const toolSet = await McpRequestToolSet.create(
+      new McpManager(configPath, { allowlist: redmineAllowlist, denylist: redmineDenylist }),
+      context,
+    );
+    expect(toolSet.tools.map(tool => tool.definition.function.name)).toEqual([
+      "mcp__redmine__list_redmine_projects",
+      "mcp__redmine__search_redmine_issues",
+    ]);
+    const search = toolSet.tools[1];
+    await expect(search.dispatch({
+      id: "redmine-call",
+      type: "function",
+      function: { name: search.definition.function.name, arguments: JSON.stringify({ query: "read-only" }) },
+    })).resolves.toMatchObject({
+      text: JSON.stringify({ issues: [{ id: 42, subject: "Read-only fixture issue" }] }),
+      isError: false,
+    });
     await toolSet.close();
   });
 

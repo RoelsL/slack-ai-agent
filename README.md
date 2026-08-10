@@ -66,6 +66,22 @@ inherit in YAML order, and denylist entries override allowlist entries. Bot,
 workflow, and Slackbot requests have no human role or email and cannot access
 identity-bound servers.
 
+### Redmine MCP (read-only)
+
+The deployment-local `mcp-servers.json` configures the `redmine` Streamable HTTP
+server at `${REDMINE_MCP_URL}`. For local development, `.env.example` documents
+`http://127.0.0.1:8000/mcp`; deployments must replace it with the approved
+production `/mcp` URL. Redmine's legacy-mode personal API-key authentication is
+owned by the Redmine MCP service. Do not add a Redmine credential, static header,
+or headers helper to this bot. The Redmine service deployment must set
+`REDMINE_MCP_READ_ONLY=true`.
+
+Only explicitly listed read tools are allowed in both `mcp-servers.json` and
+`config/tool-allowlist.yaml`; Redmine mutation and mixed-management tools are
+also denylisted as defense in depth. Member users receive these tools, with
+existing role inheritance applying them to higher roles. Unknown, anonymous,
+bot, workflow, and Slackbot requests remain without MCP tools.
+
 For remote servers, `headersHelper` is a trusted deployment-controlled `/bin/sh`
 command run per connection. It has a 5-second timeout and a combined 32 KiB
 stdout/stderr buffer. It must emit a JSON object whose values are strings. Helper
